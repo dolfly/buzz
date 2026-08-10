@@ -1240,11 +1240,15 @@ mod tests {
         Arc,
     };
 
+    use aws_lc_rs::{
+        rand::SystemRandom,
+        rsa::KeySize,
+        signature::{KeyPair, RsaKeyPair, RsaPublicKeyComponents, RSA_PKCS1_SHA256},
+    };
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
     use jsonwebtoken::jwk::JwkSet;
     use jsonwebtoken::{encode, EncodingKey, Header};
     use nostr::Keys;
-    use rsa::{pkcs1::EncodeRsaPrivateKey, rand_core::OsRng, RsaPrivateKey};
     use sqlx::PgPool;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1551,8 +1555,8 @@ mod tests {
     #[tokio::test]
     async fn validate_jwt_accepts_matching_rs256_jwk() {
         let key = rsa_private_key(0);
-        let token = rsa_test_jwt(&key, "rsa-key");
-        let claims = validate_rsa_jwt(&token, rsa_test_jwk(&key, "rsa-key"))
+        let token = rsa_test_jwt(key, "rsa-key");
+        let claims = validate_rsa_jwt(&token, rsa_test_jwk(key, "rsa-key"))
             .await
             .expect("matching RSA JWT must validate");
 
@@ -1564,9 +1568,9 @@ mod tests {
     async fn validate_jwt_rejects_rs256_token_signed_by_wrong_key() {
         let signing_key = rsa_private_key(0);
         let advertised_key = rsa_private_key(1);
-        let token = rsa_test_jwt(&signing_key, "rsa-key");
+        let token = rsa_test_jwt(signing_key, "rsa-key");
 
-        let error = validate_rsa_jwt(&token, rsa_test_jwk(&advertised_key, "rsa-key"))
+        let error = validate_rsa_jwt(&token, rsa_test_jwk(advertised_key, "rsa-key"))
             .await
             .expect_err("JWT signed by another RSA key must fail");
         assert!(matches!(error, CorporateIdentityError::InvalidJwt(_)));
@@ -1575,8 +1579,8 @@ mod tests {
     #[tokio::test]
     async fn validate_jwt_rejects_jwk_advertised_algorithm_mismatch() {
         let key = rsa_private_key(0);
-        let token = rsa_test_jwt(&key, "rsa-key");
-        let mut jwk = rsa_test_jwk(&key, "rsa-key");
+        let token = rsa_test_jwt(key, "rsa-key");
+        let mut jwk = rsa_test_jwk(key, "rsa-key");
         jwk.common.key_algorithm = Some(KeyAlgorithm::RS512);
 
         let error = validate_rsa_jwt(&token, jwk)
@@ -1592,8 +1596,8 @@ mod tests {
     #[tokio::test]
     async fn validate_jwt_accepts_jwk_with_omitted_algorithm() {
         let key = rsa_private_key(0);
-        let token = rsa_test_jwt(&key, "rsa-key");
-        let mut jwk = rsa_test_jwk(&key, "rsa-key");
+        let token = rsa_test_jwt(key, "rsa-key");
+        let mut jwk = rsa_test_jwk(key, "rsa-key");
         jwk.common.key_algorithm = None;
 
         validate_rsa_jwt(&token, jwk)
@@ -1604,7 +1608,7 @@ mod tests {
     #[test]
     fn validate_jwk_requires_signature_use_and_verify_operation_when_present() {
         let key = rsa_private_key(0);
-        let mut jwk = rsa_test_jwk(&key, "rsa-key");
+        let mut jwk = rsa_test_jwk(key, "rsa-key");
         jwk.common.public_key_use = Some(PublicKeyUse::Encryption);
         assert!(matches!(
             validate_jwk_signature_metadata(&jwk, Algorithm::RS256),
@@ -1963,10 +1967,7 @@ mod tests {
     ) -> Result<(), CanonicalVerifierError> {
         let private_key = rsa_private_key(0);
         let token = if signing_algorithm == Algorithm::RS256 {
-            let mut header = Header::new(Algorithm::RS256);
-            header.kid = Some("canonical-test-key".to_owned());
-            encode(&header, &claims, &EncodingKey::from_rsa_der(&private_key))
-                .expect("encode canonical RSA test JWT")
+            rsa_test_jwt_with_claims(private_key, "canonical-test-key", &claims)
         } else {
             let mut header = Header::new(signing_algorithm);
             header.kid = Some("canonical-test-key".to_owned());
@@ -1981,7 +1982,7 @@ mod tests {
         let key_set = CanonicalVerifierKeySet::new(
             VerifierKeyGeneration::new(1).expect("generation"),
             JwkSet {
-                keys: vec![rsa_test_jwk(&verification_material, "canonical-test-key")],
+                keys: vec![rsa_test_jwk(verification_material, "canonical-test-key")],
             },
         );
         let policy = CanonicalVerifierPolicy::new(
@@ -2006,40 +2007,63 @@ mod tests {
             .map(|_| ())
     }
 
-    fn rsa_private_key(index: usize) -> Vec<u8> {
-        static KEYS: std::sync::OnceLock<[Vec<u8>; 2]> = std::sync::OnceLock::new();
+    fn rsa_private_key(index: usize) -> &'static RsaKeyPair {
+        static KEYS: std::sync::OnceLock<[RsaKeyPair; 2]> = std::sync::OnceLock::new();
         KEYS.get_or_init(|| {
             std::array::from_fn(|_| {
-                RsaPrivateKey::new(&mut OsRng, 2_048)
-                    .expect("generate RSA test key")
-                    .to_pkcs1_der()
-                    .expect("encode generated RSA test key")
-                    .as_bytes()
-                    .to_vec()
+                RsaKeyPair::generate(KeySize::Rsa2048).expect("generate RSA test key")
             })
-        })[index]
-            .clone()
+        })
+        .get(index)
+        .expect("RSA test key index")
     }
 
-    fn rsa_test_jwk(private_key: &[u8], kid: &str) -> Jwk {
-        let encoding_key = EncodingKey::from_rsa_der(private_key);
-        let mut jwk = Jwk::from_encoding_key(&encoding_key, Algorithm::RS256)
-            .expect("derive RSA JWK from test key");
-        jwk.common.key_id = Some(kid.to_string());
-        jwk.common.public_key_use = Some(PublicKeyUse::Signature);
-        jwk.common.key_operations = Some(vec![KeyOperations::Verify]);
-        jwk
+    fn rsa_test_jwk(private_key: &RsaKeyPair, kid: &str) -> Jwk {
+        let components = RsaPublicKeyComponents::<Vec<u8>>::from(private_key.public_key());
+        serde_json::from_value(serde_json::json!({
+            "kty": "RSA",
+            "n": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(components.n),
+            "e": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(components.e),
+            "kid": kid,
+            "alg": "RS256",
+            "use": "sig",
+            "key_ops": ["verify"],
+        }))
+        .expect("derive RSA JWK from generated test key")
     }
 
-    fn rsa_test_jwt(private_key: &[u8], kid: &str) -> String {
-        let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some(kid.to_string());
-        encode(
-            &header,
+    fn rsa_test_jwt(private_key: &RsaKeyPair, kid: &str) -> String {
+        rsa_test_jwt_with_claims(
+            private_key,
+            kid,
             &valid_test_claims(Timestamp::now().as_secs()),
-            &EncodingKey::from_rsa_der(private_key),
         )
-        .expect("encode RSA test JWT")
+    }
+
+    fn rsa_test_jwt_with_claims(private_key: &RsaKeyPair, kid: &str, claims: &Value) -> String {
+        let header = serde_json::json!({
+            "alg": "RS256",
+            "typ": "JWT",
+            "kid": kid,
+        });
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&header).expect("serialize RSA JWT test header"));
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(claims).expect("serialize RSA JWT test claims"));
+        let signing_input = format!("{header}.{claims}");
+        let mut signature = vec![0_u8; private_key.public_modulus_len()];
+        private_key
+            .sign(
+                &RSA_PKCS1_SHA256,
+                &SystemRandom::new(),
+                signing_input.as_bytes(),
+                &mut signature,
+            )
+            .expect("sign generated RSA test JWT");
+        format!(
+            "{signing_input}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature)
+        )
     }
 
     async fn validate_rsa_jwt(
