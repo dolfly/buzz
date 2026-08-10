@@ -7,6 +7,7 @@
 use std::{
     future::Future,
     io::Write,
+    path::PathBuf,
     pin::Pin,
     process::{Command, Stdio},
     sync::Arc,
@@ -49,36 +50,6 @@ use uuid::Uuid;
 const PROXY_NOW: u64 = 1_800_000_000;
 const PROXY_ASSERTION: &str = "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJzdWJqZWN0In0.c2lnbmF0dXJl";
 const PROXY_SECRET: [u8; 32] = [0x53; 32];
-const TEST_RSA_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
-MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDA+T6BKOFQyrEz
-Xd/zoFuWoLu95Gmhfr3KcynweqwNWNELcVvxMkMp/3HKwzSHERtgd1BH8AkMA/le
-Oy2FeZBPMkePEXcZ6EdGgkd8E1aSuoRZeK+k/GdR84dqFHiRpY9ZNiivKo31SrMB
-tp1dB6NkWvVk4VdZnMac6iwUVtjMAZYZbiv9jquDkrArk0hzES/ldmuSbw/zYpwB
-0qvsjPpxjYHuD6BbDG9LK8yDpr8Cr5E6M1Y/ToTJ026XfgEjQeW24lXv/enMNX0B
-ds/vM9qfQ0uqxMHGq5JhP3SONK1+kJ1iUju7OU/bug8D8ojNYqDAHcLlFq36T8we
-s7cXHUybAgMBAAECggEAOet1ecHh4uR7jD3cZpzWcJ78yrGgjNLkNzwate2z72ud
-jvAu1vWtmBDuQBwYC4Q0cd9N7tGafYtB0Sk08A99I3Alb0kgNNv1bLHUr+aEARVP
-fSVOntgNUNkl506Oo7SMEoxBaNX+dsW9dcGweMg+n/P3HJjQJXr7WASnR1GLz6sS
-Xvns5FEHXAs6BpxvGmJm32HzwjsHmnrTIrn50VtbpLRgmUV7bqT2/Wr480PaofwJ
-h7IEbHu8QI/Cdg75dGe/wW2EaeQGBSHHVGUHYXure74cWSH7e1a5roLO+PXo9CdO
-x5KQ1rA3GzxduM+NISWliYehd0O/hBKUZakdWOxyFQKBgQDwwrddIqbV4t4lJn1d
-YfYVb4wwChqhEDuVSbjoMgdK7x+ag+M5QwcSDlHhTabv6ed+0mSJTpmn9EpdhfY9
-okYWpvyQF6jEsiywUh15LXGjHMlYvtFTraAAs+W9StsbHoy6xufIZvZdyU+8dufF
-vWn8mLSRvEr0TAKtaEpHR96JTQKBgQDNMDAE/EM4Klne6AgOGp6NVcqKZcKBNHlT
-8IKaAa7HUYwCRJ6K/7sb1dYOI3Z4HfjZh4yiO8PaJ+JLDnqycYoUjofekS8B4fbi
-vfxLlyEZTeqbY9yERtcYPJFToLQsN7TFfSjJldp7SJTn+umkHI13E4QlGlWBWAOz
-FjRMfpP5hwKBgQCr9sg1k7yKZOK6skU03/V+1g/ReEYQ6KFGPkP+RU2ELkvqd21i
-xwdT1DqTrH0iO3WH1grNMAD8P7amGjsJRtC8+UTIPr3i0EivH9fBZ74U/UirRJAL
-LqZsGhJsI/1f33AxMET5lOE/l7yGJn/hcysyqne+6Di5SVlYNndndmPyuQKBgBXm
-hcmSb05IXu1G0M1IlBG7zXF2KQuHYUfPTPFJKrGFh68aSd3GK99ttHov2M47TLtT
-F3SdcmsPhLzEH9559eX5zJC56E2II8TRyGL9D4BW66qIPxozQXQJyu0lIvXxQC8w
-C7FweDBeb95Ozq9AiOzjvWAEbonurf5oaU6c2AhzAoGBAPCXgwCtFTjrchoK5j8e
-uXTlkrQZkDYKsHwgoDh0jOfeuZ/f7+0T15+wWuh/3Yx5BXjMaaz7V58oPXCZkHDX
-5EaFLmiTniLlQrRwoTtcfFUNSNZOEwoqGWfrtA0tMibkZdxcM3IBu4Oa75nXKVPZ
-f9hDSYt0+Hl9FGuNjpkgLxIa
------END PRIVATE KEY-----
-"#;
-const TEST_RSA_JWKS: &str = r#"{"keys":[{"kty":"RSA","use":"sig","alg":"RS256","kid":"s4-test","n":"wPk-gSjhUMqxM13f86BblqC7veRpoX69ynMp8HqsDVjRC3Fb8TJDKf9xysM0hxEbYHdQR_AJDAP5XjsthXmQTzJHjxF3GehHRoJHfBNWkrqEWXivpPxnUfOHahR4kaWPWTYoryqN9UqzAbadXQejZFr1ZOFXWZzGnOosFFbYzAGWGW4r_Y6rg5KwK5NIcxEv5XZrkm8P82KcAdKr7Iz6cY2B7g-gWwxvSyvMg6a_Aq-ROjNWP06EydNul34BI0HltuJV7_3pzDV9AXbP7zPan0NLqsTBxquSYT90jjStfpCdYlI7uzlP27oPA_KIzWKgwB3C5Rat-k_MHrO3Fx1Mmw","e":"AQAB"}]}"#;
 
 #[derive(Default)]
 struct EmptyReplayReader;
@@ -145,7 +116,72 @@ fn base64_url(input: &[u8]) -> String {
     output
 }
 
-fn signed_test_jwt(subject: &str, event_author: [u8; 32]) -> String {
+struct EphemeralRsaKey {
+    path: PathBuf,
+}
+
+impl EphemeralRsaKey {
+    fn generate(kid: &str, prefix: &str) -> (Self, serde_json::Value) {
+        let key = Self {
+            path: std::env::temp_dir().join(format!("{prefix}-{}.pem", Uuid::new_v4())),
+        };
+        let generated = Command::new("openssl")
+            .args([
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-pkeyopt",
+                "rsa_keygen_bits:2048",
+                "-pkeyopt",
+                "rsa_keygen_pubexp:65537",
+                "-out",
+            ])
+            .arg(&key.path)
+            .output()
+            .expect("generate ephemeral RSA test key");
+        assert!(
+            generated.status.success(),
+            "OpenSSL RSA key generation failed: {}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let modulus = Command::new("openssl")
+            .args(["rsa", "-in"])
+            .arg(&key.path)
+            .args(["-noout", "-modulus"])
+            .output()
+            .expect("read ephemeral RSA test modulus");
+        assert!(
+            modulus.status.success(),
+            "OpenSSL RSA modulus extraction failed: {}",
+            String::from_utf8_lossy(&modulus.stderr)
+        );
+        let modulus = std::str::from_utf8(&modulus.stdout)
+            .expect("UTF-8 RSA test modulus")
+            .trim()
+            .strip_prefix("Modulus=")
+            .expect("OpenSSL RSA modulus prefix");
+        let modulus = hex::decode(modulus).expect("hex RSA test modulus");
+        let jwks = serde_json::json!({
+            "keys": [{
+                "kty": "RSA",
+                "use": "sig",
+                "alg": "RS256",
+                "kid": kid,
+                "n": base64_url(&modulus),
+                "e": "AQAB",
+            }],
+        });
+        (key, jwks)
+    }
+}
+
+impl Drop for EphemeralRsaKey {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn signed_test_jwt(subject: &str, event_author: [u8; 32]) -> (String, serde_json::Value) {
     let issued_at = Utc::now().timestamp() - 1;
     let claims = serde_json::json!({
         "iss": "https://s4-verifier.test",
@@ -162,11 +198,10 @@ fn signed_test_jwt(subject: &str, event_author: [u8; 32]) -> String {
         base64_url(&serde_json::to_vec(&header).expect("serialize JWT header")),
         base64_url(&serde_json::to_vec(&claims).expect("serialize JWT claims")),
     );
-    let key_path = std::env::temp_dir().join(format!("buzz-s4-jwt-{}.pem", Uuid::new_v4()));
-    std::fs::write(&key_path, TEST_RSA_PRIVATE_KEY).expect("write temporary test key");
+    let (key, jwks) = EphemeralRsaKey::generate("s4-test", "buzz-s4-jwt");
     let mut child = Command::new("openssl")
         .args(["dgst", "-sha256", "-sign"])
-        .arg(&key_path)
+        .arg(&key.path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -178,9 +213,11 @@ fn signed_test_jwt(subject: &str, event_author: [u8; 32]) -> String {
         .write_all(signing_input.as_bytes())
         .expect("write JWT signing input");
     let signed = child.wait_with_output().expect("wait for JWT signer");
-    std::fs::remove_file(&key_path).expect("remove temporary test key");
     assert!(signed.status.success(), "OpenSSL JWT signer failed");
-    format!("{signing_input}.{}", base64_url(&signed.stdout))
+    (
+        format!("{signing_input}.{}", base64_url(&signed.stdout)),
+        jwks,
+    )
 }
 
 fn verified_authorization_evidence(
@@ -190,7 +227,7 @@ fn verified_authorization_evidence(
     request: [u8; 32],
     transport_context: [u8; 32],
 ) -> (VerifiedFederatedAssertion, VerifiedNostrProof) {
-    let token = signed_test_jwt(
+    let (token, jwks) = signed_test_jwt(
         "canonical-application-subject",
         keys.public_key().to_bytes(),
     );
@@ -207,7 +244,7 @@ fn verified_authorization_evidence(
     );
     let key_set = CanonicalVerifierKeySet::new(
         VerifierKeyGeneration::new(1).expect("positive verifier generation"),
-        serde_json::from_str(TEST_RSA_JWKS).expect("parse test JWKS"),
+        serde_json::from_value(jwks).expect("parse generated test JWKS"),
     );
     let assertion = verifier
         .verify(
@@ -405,6 +442,7 @@ async fn same_domain_evidence_from_another_request_has_a_distinct_exact_binding(
     let evidence_a = verify_proxy_request(
         &verifier,
         &request_a,
+        domain,
         ProofTransport::Nip98,
         "/upload?slot=a",
         b"body-a",
@@ -414,6 +452,7 @@ async fn same_domain_evidence_from_another_request_has_a_distinct_exact_binding(
     let evidence_b = verify_proxy_request(
         &verifier,
         &request_b,
+        domain,
         ProofTransport::Blossom,
         "/upload?slot=b",
         b"body-b",
@@ -1187,13 +1226,15 @@ async fn canonical_moderation_is_atomic_target_bound_and_fresh_only() {
 async fn verify_proxy_request(
     verifier: &TrustedProxyProvenanceVerifier,
     request: &TrustedProxyRequest,
+    authorization_domain: CommunityId,
     transport: ProofTransport,
     path_and_query: &str,
     body: &[u8],
     nonce: &[u8],
 ) -> buzz_auth::SealedTransportEvidence {
     let assertion = format!("Bearer {PROXY_ASSERTION}");
-    let provenance = sign_proxy_provenance(transport, path_and_query, body, nonce);
+    let provenance =
+        sign_proxy_provenance(authorization_domain, transport, path_and_query, body, nonce);
     verifier
         .verify(
             &[
@@ -1211,6 +1252,7 @@ async fn verify_proxy_request(
 }
 
 fn sign_proxy_provenance(
+    authorization_domain: CommunityId,
     transport: ProofTransport,
     path_and_query: &str,
     body: &[u8],
@@ -1229,6 +1271,7 @@ fn sign_proxy_provenance(
         PROXY_NOW.to_be_bytes().as_slice(),
         nonce,
         &assertion_digest,
+        authorization_domain.as_uuid().as_bytes(),
         b"POST".as_slice(),
         b"relay.example.com:443".as_slice(),
         path_and_query.as_bytes(),

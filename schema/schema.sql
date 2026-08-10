@@ -254,6 +254,40 @@ CREATE TABLE IF NOT EXISTS authorization_operation_receipts (
 );
 
 --
+-- Name: authorization_admission_results; Type: TABLE; Schema: -; Owner: -
+--
+
+CREATE TABLE IF NOT EXISTS authorization_admission_results (
+    community_id uuid,
+    operation_id uuid,
+    request_fingerprint bytea NOT NULL,
+    semantic_fingerprint bytea NOT NULL,
+    object_kind smallint NOT NULL,
+    object_key bytea NOT NULL,
+    application_type bytea,
+    application_version smallint,
+    application_code smallint,
+    application_payload bytea,
+    application_intent_digest bytea,
+    application_effect_digest bytea,
+    application_result_digest bytea,
+    recorded_at timestamptz DEFAULT transaction_timestamp() NOT NULL,
+    CONSTRAINT authorization_admission_results_pkey PRIMARY KEY (community_id, operation_id),
+    CONSTRAINT authorization_admission_resul_community_id_operation_id_re_fkey FOREIGN KEY (community_id, operation_id, request_fingerprint) REFERENCES authorization_operation_receipts (community_id, operation_id, request_fingerprint),
+    CONSTRAINT authorization_admission_results_application_code_check CHECK (application_code > 0),
+    CONSTRAINT authorization_admission_results_application_effect_digest_check CHECK (application_effect_digest IS NULL OR octet_length(application_effect_digest) = 32 AND application_effect_digest <> decode(repeat('00'::text, 32), 'hex'::text)),
+    CONSTRAINT authorization_admission_results_application_intent_digest_check CHECK (application_intent_digest IS NULL OR octet_length(application_intent_digest) = 32 AND application_intent_digest <> decode(repeat('00'::text, 32), 'hex'::text)),
+    CONSTRAINT authorization_admission_results_application_payload_check CHECK (application_payload IS NULL OR octet_length(application_payload) <= 4096),
+    CONSTRAINT authorization_admission_results_application_result_digest_check CHECK (application_result_digest IS NULL OR octet_length(application_result_digest) = 32 AND application_result_digest <> decode(repeat('00'::text, 32), 'hex'::text)),
+    CONSTRAINT authorization_admission_results_application_type_check CHECK (application_type IS NULL OR octet_length(application_type) = 32 AND application_type <> decode(repeat('00'::text, 32), 'hex'::text)),
+    CONSTRAINT authorization_admission_results_application_version_check CHECK (application_version > 0),
+    CONSTRAINT authorization_admission_results_object_key_check CHECK (octet_length(object_key) = 32 AND object_key <> decode(repeat('00'::text, 32), 'hex'::text)),
+    CONSTRAINT authorization_admission_results_object_kind_check CHECK (object_kind IN (1, 2, 3, 4, 5, 6, 9)),
+    CONSTRAINT authorization_admission_results_request_fingerprint_check CHECK (octet_length(request_fingerprint) = 32),
+    CONSTRAINT authorization_admission_results_semantic_fingerprint_check CHECK (octet_length(semantic_fingerprint) = 32 AND semantic_fingerprint <> decode(repeat('00'::text, 32), 'hex'::text))
+);
+
+--
 -- Name: authorization_authority_epochs; Type: TABLE; Schema: -; Owner: -
 --
 
@@ -273,7 +307,7 @@ CREATE TABLE IF NOT EXISTS authorization_authority_epochs (
     CONSTRAINT authorization_authority_epochs_authority_epoch_check CHECK (authority_epoch > 0),
     CONSTRAINT authorization_authority_epochs_fence_check CHECK (octet_length(fence) = 32 AND fence <> decode(repeat('00'::text, 32), 'hex'::text)),
     CONSTRAINT authorization_authority_epochs_object_key_check CHECK (octet_length(object_key) = 32),
-    CONSTRAINT authorization_authority_epochs_object_kind_check CHECK (object_kind IN (1, 2, 3, 4, 5, 6)),
+    CONSTRAINT authorization_authority_epochs_object_kind_check CHECK (object_kind IN (1, 2, 3, 4, 5, 6, 9)),
     CONSTRAINT authorization_authority_epochs_request_fingerprint_check CHECK (octet_length(request_fingerprint) = 32)
 );
 
@@ -2731,7 +2765,7 @@ CREATE TABLE IF NOT EXISTS protected_object_authority (
     CONSTRAINT protected_object_authority_fence_check CHECK (octet_length(fence) = 32 AND fence <> decode(repeat('00'::text, 32), 'hex'::text)),
     CONSTRAINT protected_object_authority_invalidation_generation_check CHECK (invalidation_generation >= 0),
     CONSTRAINT protected_object_authority_object_key_check CHECK (octet_length(object_key) = 32),
-    CONSTRAINT protected_object_authority_object_kind_check CHECK (object_kind IN (1, 2, 3, 4, 5, 6)),
+    CONSTRAINT protected_object_authority_object_kind_check CHECK (object_kind IN (1, 2, 3, 4, 5, 6, 9)),
     CONSTRAINT protected_object_authority_owner_pubkey_check CHECK (owner_pubkey IS NULL OR octet_length(owner_pubkey) = 32),
     CONSTRAINT protected_object_authority_policy_revision_check CHECK (policy_revision > 0),
     CONSTRAINT protected_object_authority_request_fingerprint_check CHECK (octet_length(request_fingerprint) = 32)

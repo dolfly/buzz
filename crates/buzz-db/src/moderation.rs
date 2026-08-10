@@ -934,6 +934,14 @@ mod tests {
         bytes
     }
 
+    fn assert_database_constraint(error: &sqlx::Error, code: &str, constraint: &str) {
+        let database = error
+            .as_database_error()
+            .expect("expected PostgreSQL database error");
+        assert_eq!(database.code().as_deref(), Some(code));
+        assert_eq!(database.constraint(), Some(constraint));
+    }
+
     fn new_report<'a>(
         report_event_id: &'a [u8],
         reporter_pubkey: &'a [u8],
@@ -1721,50 +1729,6 @@ mod tests {
         .await;
         assert!(expired.is_err(), "equality at retain_until is expired");
 
-        // Construct an exact equality row transactionally with only the stamp
-        // trigger disabled. The table CHECK remains active. This proves the
-        // deletion trigger retains through, not merely until, the boundary.
-        let equality_key = random_32();
-        let mut equality = pool.begin().await.expect("begin equality probe");
-        sqlx::query(
-            "ALTER TABLE authorization_proxy_nonce_claims \
-             DISABLE TRIGGER authorization_proxy_nonce_claims_stamp",
-        )
-        .execute(&mut *equality)
-        .await
-        .expect("disable insert stamp in rollback-only probe");
-        sqlx::query(
-            "INSERT INTO authorization_proxy_nonce_claims \
-             (authorization_domain, claim_kind, claim_key, committed_at, retain_until) \
-             VALUES ($1, 1, $2, transaction_timestamp() - INTERVAL '1 second', \
-                     transaction_timestamp())",
-        )
-        .bind(domain_a.as_uuid())
-        .bind(&equality_key)
-        .execute(&mut *equality)
-        .await
-        .expect("insert exact-boundary probe row");
-        sqlx::query(
-            "ALTER TABLE authorization_proxy_nonce_claims \
-             ENABLE TRIGGER authorization_proxy_nonce_claims_stamp",
-        )
-        .execute(&mut *equality)
-        .await
-        .expect("restore insert stamp in probe");
-        let equality_delete = sqlx::query(
-            "DELETE FROM authorization_proxy_nonce_claims \
-             WHERE authorization_domain = $1 AND claim_kind = 1 AND claim_key = $2",
-        )
-        .bind(domain_a.as_uuid())
-        .bind(&equality_key)
-        .execute(&mut *equality)
-        .await;
-        assert!(
-            equality_delete.is_err(),
-            "deletion at the exclusive retain_until equality must be rejected"
-        );
-        equality.rollback().await.expect("rollback equality probe");
-
         let rolled_back_key = random_32();
         let mut transaction = pool.begin().await.expect("begin claim transaction");
         sqlx::query(
@@ -1815,7 +1779,107 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
-    async fn protected_projection_outbox_is_target_bound_ordered_and_idempotent() {
+    async fn proxy_nonce_deletion_is_strictly_after_retention_bound() {
+        let pool = setup_pool().await;
+        crate::migration::run_migrations(&pool)
+            .await
+            .expect("apply nonce-claim migration");
+        let domain = make_test_community(&pool).await;
+
+        // transaction_timestamp() is stable within this transaction, making
+        // retain_until byte-for-byte equal to the DELETE trigger's clock.
+        let equality_key = random_32();
+        let mut equality = pool.begin().await.expect("begin equality probe");
+        sqlx::query(
+            "ALTER TABLE authorization_proxy_nonce_claims \
+             DISABLE TRIGGER authorization_proxy_nonce_claims_stamp",
+        )
+        .execute(&mut *equality)
+        .await
+        .expect("disable only the insert stamp in equality probe");
+        sqlx::query(
+            "INSERT INTO authorization_proxy_nonce_claims \
+             (authorization_domain, claim_kind, claim_key, committed_at, retain_until) \
+             VALUES ($1, 1, $2, transaction_timestamp() - INTERVAL '1 microsecond', \
+                     transaction_timestamp())",
+        )
+        .bind(domain.as_uuid())
+        .bind(&equality_key)
+        .execute(&mut *equality)
+        .await
+        .expect("insert exact-boundary nonce claim");
+        sqlx::query(
+            "ALTER TABLE authorization_proxy_nonce_claims \
+             ENABLE TRIGGER authorization_proxy_nonce_claims_stamp",
+        )
+        .execute(&mut *equality)
+        .await
+        .expect("restore insert stamp before equality DELETE");
+        let equality_error = sqlx::query(
+            "DELETE FROM authorization_proxy_nonce_claims \
+             WHERE authorization_domain = $1 AND claim_kind = 1 AND claim_key = $2",
+        )
+        .bind(domain.as_uuid())
+        .bind(&equality_key)
+        .execute(&mut *equality)
+        .await
+        .expect_err("deletion at retain_until equality must be rejected");
+        assert_database_constraint(
+            &equality_error,
+            "23514",
+            "authorization_proxy_nonce_claim_retention",
+        );
+        equality
+            .rollback()
+            .await
+            .expect("rollback aborted equality probe");
+
+        let strictly_after_key = random_32();
+        let mut strictly_after = pool.begin().await.expect("begin strictly-after probe");
+        sqlx::query(
+            "ALTER TABLE authorization_proxy_nonce_claims \
+             DISABLE TRIGGER authorization_proxy_nonce_claims_stamp",
+        )
+        .execute(&mut *strictly_after)
+        .await
+        .expect("disable only the insert stamp in strictly-after probe");
+        sqlx::query(
+            "INSERT INTO authorization_proxy_nonce_claims \
+             (authorization_domain, claim_kind, claim_key, committed_at, retain_until) \
+             VALUES ($1, 1, $2, transaction_timestamp() - INTERVAL '2 microseconds', \
+                     transaction_timestamp() - INTERVAL '1 microsecond')",
+        )
+        .bind(domain.as_uuid())
+        .bind(&strictly_after_key)
+        .execute(&mut *strictly_after)
+        .await
+        .expect("insert elapsed-boundary nonce claim");
+        sqlx::query(
+            "ALTER TABLE authorization_proxy_nonce_claims \
+             ENABLE TRIGGER authorization_proxy_nonce_claims_stamp",
+        )
+        .execute(&mut *strictly_after)
+        .await
+        .expect("restore insert stamp before strictly-after DELETE");
+        let deleted = sqlx::query(
+            "DELETE FROM authorization_proxy_nonce_claims \
+             WHERE authorization_domain = $1 AND claim_kind = 1 AND claim_key = $2",
+        )
+        .bind(domain.as_uuid())
+        .bind(&strictly_after_key)
+        .execute(&mut *strictly_after)
+        .await
+        .expect("strictly elapsed retention bound permits deletion");
+        assert_eq!(deleted.rows_affected(), 1);
+        strictly_after
+            .commit()
+            .await
+            .expect("commit strictly-after deletion");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn protected_projection_outbox_releases_only_terminal_targets() {
         let pool = setup_pool().await;
         crate::migration::run_migrations(&pool)
             .await
@@ -1833,90 +1897,186 @@ mod tests {
         .await
         .expect("install outbox-test audit capacity");
 
-        let seed = stage_publication_admission(&pool, community, &object_key, 1, false)
+        let first = stage_publication_admission(&pool, community, &object_key, 2, true)
             .await
-            .expect("stage seed admission");
-        sqlx::query(
-            "INSERT INTO authorization_authority_epochs \
-             (community_id, object_kind, object_key, authority_epoch, fence, \
-              operation_id, request_fingerprint) \
-             VALUES ($1, 3, $2, 7, $3, $4, $5)",
+            .expect("stage first publication admission");
+        set_publication_authority_epoch(&pool, community, &object_key, &first, 7)
+            .await
+            .expect("install first publication authority epoch");
+        insert_projection(&pool, community, &first, &object_key, &projection_key)
+            .await
+            .expect("insert first projection");
+
+        let second = stage_publication_admission(&pool, community, &object_key, 3, true)
+            .await
+            .expect("stage second publication under the same authority epoch");
+        let retained_epoch_operation: Uuid = sqlx::query_scalar(
+            "SELECT operation_id FROM authorization_authority_epochs \
+             WHERE community_id = $1 AND object_kind = 3 AND object_key = $2",
         )
         .bind(community.as_uuid())
         .bind(&object_key)
-        .bind(random_32())
-        .bind(seed.operation)
-        .bind(&seed.request)
-        .execute(&pool)
+        .fetch_one(&pool)
         .await
-        .expect("install unchanged same-epoch authority row");
+        .expect("read retained authority epoch origin");
+        assert_eq!(retained_epoch_operation, first.operation);
+        assert_ne!(retained_epoch_operation, second.operation);
+        let second_conflict =
+            insert_projection(&pool, community, &second, &object_key, &projection_key)
+                .await
+                .expect_err("one exact target cannot have two pending projections");
+        assert_database_constraint(
+            &second_conflict,
+            "23505",
+            "protected_publication_projection_outbox_active_target",
+        );
 
-        let first = stage_publication_admission(&pool, community, &object_key, 2, true);
-        let second = stage_publication_admission(&pool, community, &object_key, 3, true);
-        let (first, second) = tokio::join!(first, second);
-        let first = first.expect("first concurrent same-epoch publication");
-        let second = second.expect("second concurrent same-epoch publication");
-
-        let first_projection =
-            insert_projection(&pool, community, &first, &object_key, &projection_key);
-        let second_projection =
-            insert_projection(&pool, community, &second, &object_key, &projection_key);
-        let (first_projection, second_projection) =
-            tokio::join!(first_projection, second_projection);
-        first_projection.expect("insert first concurrent same-epoch projection");
-        second_projection.expect("insert second concurrent same-epoch projection");
-
-        let rows: Vec<(Uuid, i64)> = sqlx::query_as(
-            "SELECT operation_id, publication_sequence \
-             FROM protected_publication_projection_outbox \
-             WHERE community_id = $1 AND object_kind = 3 AND object_key = $2 \
-               AND projection_kind = 3 AND projection_key = $3 \
-             ORDER BY publication_sequence",
-        )
-        .bind(community.as_uuid())
-        .bind(&object_key)
-        .bind(&projection_key)
-        .fetch_all(&pool)
-        .await
-        .expect("read concurrent publication order");
-        assert_eq!(rows.len(), 2);
-        assert_ne!(rows[0].0, rows[1].0);
-        assert!(rows[0].1 < rows[1].1);
-
-        let stale_delivery = sqlx::query(
+        let delivered = sqlx::query(
             "UPDATE protected_publication_projection_outbox \
-             SET delivery_state = 2, attempt_count = 1, failure_code = 0 \
+             SET delivery_state = 2, attempt_count = attempt_count + 1, failure_code = 0 \
              WHERE community_id = $1 AND operation_id = $2 AND projection_kind = 3",
         )
         .bind(community.as_uuid())
-        .bind(rows[1].0)
+        .bind(first.operation)
         .execute(&pool)
-        .await;
-        assert!(
-            stale_delivery.is_err(),
-            "newer concurrent version is fenced"
-        );
-        for (operation, _) in &rows {
-            sqlx::query(
-                "UPDATE protected_publication_projection_outbox \
-                 SET delivery_state = 2, attempt_count = 1, failure_code = 0 \
-                 WHERE community_id = $1 AND operation_id = $2 AND projection_kind = 3",
-            )
-            .bind(community.as_uuid())
-            .bind(operation)
-            .execute(&pool)
-            .await
-            .expect("deliver concurrent versions in database order");
-        }
+        .await
+        .expect("transition first projection to delivered");
+        assert_eq!(delivered.rows_affected(), 1);
 
         let duplicate =
             insert_projection(&pool, community, &first, &object_key, &projection_key).await;
-        assert!(
-            duplicate.is_err(),
-            "exact replay cannot duplicate an outbox effect"
+        let duplicate = duplicate.expect_err("exact replay cannot duplicate an outbox effect");
+        assert_database_constraint(
+            &duplicate,
+            "23505",
+            "protected_publication_projection_outbox_pkey",
         );
 
-        let mismatch = stage_publication_admission(&pool, community, &object_key, 4, true)
+        let delivered_reopen = sqlx::query(
+            "UPDATE protected_publication_projection_outbox \
+             SET delivery_state = 1, attempt_count = attempt_count + 1, failure_code = 1 \
+             WHERE community_id = $1 AND operation_id = $2 AND projection_kind = 3",
+        )
+        .bind(community.as_uuid())
+        .bind(first.operation)
+        .execute(&pool)
+        .await
+        .expect_err("delivered projection must not return to pending");
+        assert_database_constraint(
+            &delivered_reopen,
+            "23514",
+            "protected_publication_projection_transition",
+        );
+
+        insert_projection(&pool, community, &second, &object_key, &projection_key)
+            .await
+            .expect("terminal first projection releases the exact target");
+
+        let third = stage_publication_admission(&pool, community, &object_key, 4, true)
+            .await
+            .expect("stage third publication under the same authority epoch");
+        let third_conflict =
+            insert_projection(&pool, community, &third, &object_key, &projection_key)
+                .await
+                .expect_err("second pending projection must retain the exact target");
+        assert_database_constraint(
+            &third_conflict,
+            "23505",
+            "protected_publication_projection_outbox_active_target",
+        );
+
+        let terminal = sqlx::query(
+            "UPDATE protected_publication_projection_outbox \
+             SET delivery_state = 3, attempt_count = attempt_count + 1, failure_code = 3 \
+             WHERE community_id = $1 AND operation_id = $2 AND projection_kind = 3",
+        )
+        .bind(community.as_uuid())
+        .bind(second.operation)
+        .execute(&pool)
+        .await
+        .expect("transition second projection to permanent terminal failure");
+        assert_eq!(terminal.rows_affected(), 1);
+
+        let terminal_reopen = sqlx::query(
+            "UPDATE protected_publication_projection_outbox \
+             SET delivery_state = 1, attempt_count = attempt_count + 1, failure_code = 1 \
+             WHERE community_id = $1 AND operation_id = $2 AND projection_kind = 3",
+        )
+        .bind(community.as_uuid())
+        .bind(second.operation)
+        .execute(&pool)
+        .await
+        .expect_err("terminal projection must not return to pending");
+        assert_database_constraint(
+            &terminal_reopen,
+            "23514",
+            "protected_publication_projection_transition",
+        );
+
+        insert_projection(&pool, community, &third, &object_key, &projection_key)
+            .await
+            .expect("terminal second projection releases the exact target");
+
+        let (active_count, historical_count): (i64, i64) = sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE delivery_state = 1), count(*) \
+             FROM protected_publication_projection_outbox \
+             WHERE community_id = $1 AND projection_kind = 3 AND projection_key = $2",
+        )
+        .bind(community.as_uuid())
+        .bind(&projection_key)
+        .fetch_one(&pool)
+        .await
+        .expect("count active and historical exact-target projections");
+        assert_eq!(active_count, 1);
+        assert_eq!(historical_count, 3);
+
+        let other_target = stage_publication_admission(&pool, community, &object_key, 5, true)
+            .await
+            .expect("stage independent target admission");
+        insert_projection(
+            &pool,
+            community,
+            &other_target,
+            &object_key,
+            &format!("{projection_key}/independent-target"),
+        )
+        .await
+        .expect("different target tuple remains independent");
+
+        let other_community = make_test_community(&pool).await;
+        sqlx::query(
+            "INSERT INTO authorization_event_capacity \
+             (community_id, max_events_per_domain, max_bytes_per_domain, max_envelope_bytes) \
+             VALUES ($1, 32, 1048576, 16384)",
+        )
+        .bind(other_community.as_uuid())
+        .execute(&pool)
+        .await
+        .expect("install independent-community audit capacity");
+        let other_community_projection =
+            stage_publication_admission(&pool, other_community, &object_key, 6, true)
+                .await
+                .expect("stage independent-community admission");
+        set_publication_authority_epoch(
+            &pool,
+            other_community,
+            &object_key,
+            &other_community_projection,
+            7,
+        )
+        .await
+        .expect("install independent-community authority epoch");
+        insert_projection(
+            &pool,
+            other_community,
+            &other_community_projection,
+            &object_key,
+            &projection_key,
+        )
+        .await
+        .expect("same target coordinates remain independent across communities");
+
+        let mismatch = stage_publication_admission(&pool, community, &object_key, 7, true)
             .await
             .expect("stage mismatch admission");
         let mut mismatch_tx = pool.begin().await.expect("begin mismatch projection");
@@ -1941,12 +2101,72 @@ mod tests {
         .execute(&mut *mismatch_tx)
         .await
         .expect("stage deferred effect mismatch");
-        assert!(
-            mismatch_tx.commit().await.is_err(),
-            "application effect mismatch must fail deferred binding"
+        let mismatch_error = mismatch_tx
+            .commit()
+            .await
+            .expect_err("application effect mismatch must fail deferred binding");
+        assert_database_constraint(
+            &mismatch_error,
+            "23503",
+            "protected_publication_projection_receipt",
         );
 
-        let lower = stage_publication_admission(&pool, community, &object_key, 5, false)
+        let tampered = stage_publication_admission_with_receipt_binding(
+            &pool,
+            community,
+            &object_key,
+            8,
+            true,
+            false,
+        )
+        .await
+        .expect("stage receipt-digest tamper probe");
+        let mut tampered_tx = pool.begin().await.expect("begin receipt tamper probe");
+        insert_projection_in_transaction(
+            &mut tampered_tx,
+            community,
+            &tampered,
+            &object_key,
+            &format!("{projection_key}/tampered-receipt"),
+        )
+        .await
+        .expect("stage receipt-digest tamper projection");
+        let tampered_error = tampered_tx
+            .commit()
+            .await
+            .expect_err("receipt result_digest bytes must bind the projection result");
+        assert_database_constraint(
+            &tampered_error,
+            "23503",
+            "protected_publication_projection_receipt",
+        );
+
+        let independent_object_key = random_32();
+        let independent =
+            stage_publication_admission(&pool, community, &independent_object_key, 9, true)
+                .await
+                .expect("stage independently inserted projection probe");
+        let mut independent_tx = pool.begin().await.expect("begin independent row probe");
+        insert_projection_in_transaction(
+            &mut independent_tx,
+            community,
+            &independent,
+            &independent_object_key,
+            &format!("{projection_key}/independent"),
+        )
+        .await
+        .expect("stage independently inserted outbox row");
+        let independent_error = independent_tx
+            .commit()
+            .await
+            .expect_err("outbox row for an object without an authority epoch must fail");
+        assert_database_constraint(
+            &independent_error,
+            "23503",
+            "protected_publication_projection_receipt",
+        );
+
+        let lower = stage_publication_admission(&pool, community, &object_key, 10, false)
             .await
             .expect("stage receipt rejected before an admission result");
         let mut lower_tx = pool.begin().await.expect("begin lower-epoch projection");
@@ -1971,9 +2191,14 @@ mod tests {
         .execute(&mut *lower_tx)
         .await
         .expect("stage lower-epoch projection without admitted result");
-        assert!(
-            lower_tx.commit().await.is_err(),
-            "a lower-epoch denial without a committed admission result cannot publish"
+        let lower_error = lower_tx
+            .commit()
+            .await
+            .expect_err("a lower-epoch denial without a committed admission result cannot publish");
+        assert_database_constraint(
+            &lower_error,
+            "23503",
+            "protected_publication_projection_receipt",
         );
     }
 
@@ -1992,6 +2217,25 @@ mod tests {
         object_key: &[u8],
         marker: u8,
         include_admission_result: bool,
+    ) -> std::result::Result<PublicationAdmissionFixture, sqlx::Error> {
+        stage_publication_admission_with_receipt_binding(
+            pool,
+            community,
+            object_key,
+            marker,
+            include_admission_result,
+            true,
+        )
+        .await
+    }
+
+    async fn stage_publication_admission_with_receipt_binding(
+        pool: &PgPool,
+        community: CommunityId,
+        object_key: &[u8],
+        marker: u8,
+        include_admission_result: bool,
+        receipt_matches_application: bool,
     ) -> std::result::Result<PublicationAdmissionFixture, sqlx::Error> {
         let fixture = PublicationAdmissionFixture {
             operation: Uuid::new_v4(),
@@ -2012,7 +2256,11 @@ mod tests {
         .bind(fixture.operation)
         .bind(&fixture.request)
         .bind(vec![marker.saturating_add(60); 32])
-        .bind(vec![marker.saturating_add(70); 32])
+        .bind(if receipt_matches_application {
+            fixture.application_result.clone()
+        } else {
+            vec![marker.saturating_add(70); 32]
+        })
         .execute(&mut *transaction)
         .await?;
         sqlx::query(
@@ -2060,6 +2308,39 @@ mod tests {
         Ok(fixture)
     }
 
+    async fn set_publication_authority_epoch(
+        pool: &PgPool,
+        community: CommunityId,
+        object_key: &[u8],
+        fixture: &PublicationAdmissionFixture,
+        authority_epoch: i64,
+    ) -> std::result::Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO authorization_authority_epochs \
+             (community_id, object_kind, object_key, authority_epoch, fence, \
+              operation_id, request_fingerprint) \
+             VALUES ($1, 3, $2, $3, $4, $5, $6) \
+             ON CONFLICT (community_id, object_kind, object_key) DO UPDATE \
+             SET authority_epoch = EXCLUDED.authority_epoch, \
+                 fence = EXCLUDED.fence, \
+                 operation_id = EXCLUDED.operation_id, \
+                 request_fingerprint = EXCLUDED.request_fingerprint, \
+                 updated_at = GREATEST( \
+                     transaction_timestamp(), \
+                     authorization_authority_epochs.updated_at + INTERVAL '1 microsecond' \
+                 )",
+        )
+        .bind(community.as_uuid())
+        .bind(object_key)
+        .bind(authority_epoch)
+        .bind(random_32())
+        .bind(fixture.operation)
+        .bind(&fixture.request)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
     async fn insert_projection(
         pool: &PgPool,
         community: CommunityId,
@@ -2086,6 +2367,35 @@ mod tests {
         .bind(format!("manifests/{}", fixture.operation))
         .bind(&fixture.payload)
         .execute(pool)
+        .await
+    }
+
+    async fn insert_projection_in_transaction(
+        transaction: &mut Transaction<'_, Postgres>,
+        community: CommunityId,
+        fixture: &PublicationAdmissionFixture,
+        object_key: &[u8],
+        projection_key: &str,
+    ) -> std::result::Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO protected_publication_projection_outbox \
+             (community_id, operation_id, request_fingerprint, publication_result_digest, \
+              object_kind, object_key, application_type, application_version, \
+              application_effect_digest, projection_kind, projection_key, \
+              staged_object_key, payload_digest) \
+             VALUES ($1, $2, $3, $4, 3, $5, $6, 1, $7, 3, $8, $9, $10)",
+        )
+        .bind(community.as_uuid())
+        .bind(fixture.operation)
+        .bind(&fixture.request)
+        .bind(&fixture.application_result)
+        .bind(object_key)
+        .bind(&fixture.application_type)
+        .bind(&fixture.application_effect)
+        .bind(projection_key)
+        .bind(format!("manifests/{}", fixture.operation))
+        .bind(&fixture.payload)
+        .execute(&mut **transaction)
         .await
     }
 }

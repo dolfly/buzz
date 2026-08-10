@@ -561,7 +561,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 33);
+        assert_eq!(migrations.len(), 34);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1022,6 +1022,22 @@ mod tests {
                 "migration 0034 missing operator pre-auth audit surface: {required}",
             );
         }
+
+        assert_eq!(migrations[33].version, 36);
+        let invitation_object_kind = migrations[33].sql.as_str();
+        for required in [
+            "authorization_admission_results_object_kind_check",
+            "authorization_authority_epochs_object_kind_check",
+            "protected_object_authority_object_kind_check",
+            "object_kind IN (1, 2, 3, 4, 5, 6, 9)",
+            "NOT VALID",
+            "VALIDATE CONSTRAINT",
+        ] {
+            assert!(
+                invitation_object_kind.contains(required),
+                "migration 0036 missing Invitation object-kind closure: {required}",
+            );
+        }
     }
 
     #[test]
@@ -1264,7 +1280,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(34));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(36));
     }
 
     #[tokio::test]
@@ -1397,4 +1413,6 @@ mod tests {
     mod nip_fi_authorization_tests;
     #[path = "migration_nip_fi_tests.rs"]
     mod nip_fi_direct_final_tests;
+    #[path = "migration_nip_fi_invitation_object_tests.rs"]
+    mod nip_fi_invitation_object_tests;
 }

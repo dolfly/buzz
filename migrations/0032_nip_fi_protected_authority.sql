@@ -139,6 +139,11 @@ CREATE TABLE protected_publication_projection_outbox (
 ALTER SEQUENCE protected_publication_projection_sequence_v1
     OWNED BY protected_publication_projection_outbox.publication_sequence;
 
+CREATE UNIQUE INDEX protected_publication_projection_outbox_active_target
+    ON protected_publication_projection_outbox
+        (community_id, projection_kind, projection_key)
+    WHERE delivery_state = 1;
+
 CREATE INDEX protected_publication_projection_outbox_pending
     ON protected_publication_projection_outbox
         (delivery_state, next_attempt_at, community_id, operation_id)
@@ -174,8 +179,6 @@ BEGIN
             jsonb_build_array(
                 'buzz:nip-fi:protected-publication-projection:v1',
                 NEW.community_id::TEXT,
-                NEW.object_kind,
-                encode(NEW.object_key, 'hex'),
                 NEW.projection_kind,
                 NEW.projection_key
             )::TEXT,
@@ -205,6 +208,10 @@ BEGIN
           ON admission.community_id = receipt.community_id
          AND admission.operation_id = receipt.operation_id
          AND admission.request_fingerprint = receipt.request_fingerprint
+        JOIN authorization_authority_epochs epoch
+          ON epoch.community_id = admission.community_id
+         AND epoch.object_kind = admission.object_kind
+         AND epoch.object_key = admission.object_key
         WHERE receipt.community_id = NEW.community_id
           AND receipt.operation_id = NEW.operation_id
           AND receipt.request_fingerprint = NEW.request_fingerprint
@@ -212,6 +219,7 @@ BEGIN
           -- every later established-binding mutation uses kind 11.
           AND receipt.operation_kind IN (1, 11)
           AND receipt.outcome_code = 1
+          AND receipt.result_digest = NEW.publication_result_digest
           AND admission.object_kind = NEW.object_kind
           AND admission.object_key = NEW.object_key
           AND admission.application_type = NEW.application_type
