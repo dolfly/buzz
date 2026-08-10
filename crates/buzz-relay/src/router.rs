@@ -23,6 +23,7 @@ use tower_http::trace::{HttpMakeClassifier, TraceLayer};
 
 use crate::api;
 use crate::audio;
+use crate::authorization_runtime::ProviderFreeRuntimeMode;
 use crate::connection::handle_connection;
 use crate::metrics::track_metrics;
 use crate::nip11::{nip11_document, relay_info_handler};
@@ -194,35 +195,47 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // before its handler can perform reads or writes.
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            enforce_corporate_identity_route_inventory,
+            enforce_nip_fi_route_inventory,
         ))
         .layer(middleware::from_fn(track_metrics))
         .layer(http_trace_layer())
         .layer(build_cors_layer(&state.config.cors_origins))
 }
 
-async fn enforce_corporate_identity_route_inventory(
+async fn enforce_nip_fi_route_inventory(
     State(state): State<Arc<AppState>>,
     request: Request<Body>,
     next: Next,
 ) -> axum::response::Response {
-    enforce_route_inventory_for_requirement(state.config.corporate_identity.require, request, next)
-        .await
+    enforce_route_inventory_for_mode(state.authorization_runtime.mode(), request, next).await
 }
 
-async fn enforce_route_inventory_for_requirement(
-    corporate_identity_required: bool,
+async fn enforce_route_inventory_for_mode(
+    mode: ProviderFreeRuntimeMode,
     request: Request<Body>,
     next: Next,
 ) -> axum::response::Response {
-    if !corporate_identity_required {
+    if mode == ProviderFreeRuntimeMode::Off {
         return next.run(request).await;
     }
     let matched_path = request.extensions().get::<MatchedPath>();
     let policy = matched_path
         .and_then(|path| route_policy::classify_matched_route(request.method(), path.as_str()));
-    if policy.is_some() {
-        return next.run(request).await;
+    if let Some(policy) = policy {
+        if let route_policy::CorporateIdentityRoutePolicy::Exempt(exemption) = policy {
+            if exemption != route_policy::CorporateIdentityExemption::OperatorAuth {
+                return next.run(request).await;
+            }
+        }
+        // The concrete handler and current-status adapters are separately owned and
+        // remain held. Enforce and emergency-denial modes therefore stop every
+        // protected handler here. The adapter release replaces this branch
+        // with typed RouteAuthority resolution and a finalizer recheck.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "protected route unavailable: canonical admission adapter is not installed",
+        )
+            .into_response();
     }
     if matched_path.is_some_and(|path| route_policy::is_known_matched_path(path.as_str())) {
         // Axum's method fallback also runs route layers. Return its semantic
@@ -240,11 +253,11 @@ async fn enforce_route_inventory_for_requirement(
     tracing::error!(
         method = %request.method(),
         matched_path = matched_path.map(|path| path.as_str()).unwrap_or("<missing>"),
-        "rejecting route missing corporate identity policy classification"
+        "rejecting route missing provider-free authorization classification"
     );
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        "route unavailable: identity policy is not configured",
+        "route unavailable: authorization policy is not configured",
     )
         .into_response()
 }
@@ -254,7 +267,7 @@ fn http_trace_layer() -> TraceLayer<HttpMakeClassifier, fn(&Request<Body>) -> tr
 }
 
 fn make_http_span(request: &Request<Body>) -> tracing::Span {
-    let corporate_identity_policy = request
+    let authorization_policy = request
         .extensions()
         .get::<MatchedPath>()
         .and_then(|path| route_policy::classify_matched_route(request.method(), path.as_str()))
@@ -265,7 +278,7 @@ fn make_http_span(request: &Request<Body>) -> tracing::Span {
         "http.request",
         otel.kind = "server",
         http.request.method = %request.method(),
-        buzz.corporate_identity.route_policy = corporate_identity_policy,
+        buzz.nip_fi.route_policy = authorization_policy,
     )
 }
 
@@ -433,7 +446,7 @@ async fn liveness_handler() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-/// Readiness probe — checks shutdown flag, Postgres, and Redis connectivity.
+/// Readiness probe — checks shutdown, authorization, Postgres, and Redis.
 async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     use std::time::Duration;
 
@@ -441,6 +454,17 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"status": "shutting_down"})),
+        )
+            .into_response();
+    }
+
+    if !state.authorization_runtime.is_ready() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "not_ready",
+                "authorization_runtime": "unavailable"
+            })),
         )
             .into_response();
     }
@@ -474,6 +498,10 @@ async fn status_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         "service": "buzz-relay",
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_seconds": uptime_secs,
+        "authorization_runtime": {
+            "mode": format!("{:?}", state.authorization_runtime.mode()),
+            "ready": state.authorization_runtime.is_ready(),
+        },
     }))
 }
 
@@ -533,26 +561,58 @@ mod tests {
 
     use super::*;
 
-    async fn require_route_inventory(
+    async fn enforce_provider_free_inventory(
         request: Request<Body>,
         next: Next,
     ) -> axum::response::Response {
-        enforce_route_inventory_for_requirement(true, request, next).await
+        enforce_route_inventory_for_mode(ProviderFreeRuntimeMode::Enforce, request, next).await
     }
 
     #[tokio::test]
-    async fn route_inventory_preserves_405_and_rejects_new_unclassified_handlers() {
+    async fn route_inventory_holds_protected_handlers_and_preserves_public_exemptions() {
         let app = Router::new()
             .route("/events", post(|| async { StatusCode::OK }))
+            .route("/api/invites", post(|| async { StatusCode::OK }))
+            .route("/operator/communities", get(|| async { StatusCode::OK }))
+            .route("/api/join-policy", get(|| async { StatusCode::OK }))
             .route("/new-unclassified-route", get(|| async { StatusCode::OK }))
-            .route_layer(middleware::from_fn(require_route_inventory));
+            .route_layer(middleware::from_fn(enforce_provider_free_inventory));
 
-        let allowed = app
+        let event = app
             .clone()
             .oneshot(Request::post("/events").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(allowed.status(), StatusCode::OK);
+        assert_eq!(event.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let relay_invite = app
+            .clone()
+            .oneshot(Request::post("/api/invites").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(relay_invite.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let operator = app
+            .clone()
+            .oneshot(
+                Request::get("/operator/communities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(operator.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let public_policy = app
+            .clone()
+            .oneshot(
+                Request::get("/api/join-policy")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public_policy.status(), StatusCode::OK);
 
         let unsupported = app
             .clone()

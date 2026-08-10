@@ -31,6 +31,7 @@ use buzz_workflow::WorkflowEngine;
 use deadpool_redis;
 
 use crate::audio::AudioRoomManager;
+use crate::authorization_runtime::InstalledAuthorizationRuntime;
 use crate::config::Config;
 use crate::connection::{ConnectionSubscriptions, RestartClose};
 use crate::corporate_identity::CorporateIdentityService;
@@ -643,6 +644,8 @@ pub struct AppState {
     pub auth: Arc<AuthService>,
     /// Optional corporate identity verifier.
     pub corporate_identity: Option<Arc<CorporateIdentityService>>,
+    /// One immutable provider-free authorization runtime installation.
+    pub authorization_runtime: Arc<InstalledAuthorizationRuntime>,
     /// Full-text search service.
     pub search: Arc<SearchService>,
     /// Registry of active client subscriptions.
@@ -803,50 +806,50 @@ impl AppState {
         relay_keypair: nostr::Keys,
         media_storage: MediaStorage,
     ) -> (Self, AuditShutdownHandle) {
+        let authorization_runtime = InstalledAuthorizationRuntime::fail_closed(&config.nip_fi);
+        Self::new_with_authorization_runtime(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            relay_keypair,
+            media_storage,
+            authorization_runtime,
+        )
+    }
+
+    /// Constructs `AppState` with a complete immutable authorization runtime.
+    /// Production uses this entry point only after ordered startup succeeds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_authorization_runtime(
+        config: Config,
+        db: Db,
+        redis_pool: deadpool_redis::Pool,
+        audit: impl Into<Option<AuditService>>,
+        pubsub: Arc<PubSubManager>,
+        auth: AuthService,
+        search: SearchService,
+        workflow_engine: Arc<WorkflowEngine>,
+        relay_keypair: nostr::Keys,
+        media_storage: MediaStorage,
+        authorization_runtime: InstalledAuthorizationRuntime,
+    ) -> (Self, AuditShutdownHandle) {
         let max_connections = config.max_connections;
         let max_concurrent_handlers = config.max_concurrent_handlers;
         let search_arc = Arc::new(search);
-        let corporate_identity =
-            crate::corporate_identity::service_from_config(&config.corporate_identity);
+        // The retained legacy shape serves held adapters only. Production
+        // cannot construct its verifier or mutate its removed identity tables.
+        let corporate_identity = None;
 
         let audit_arc = audit.into().map(Arc::new);
         let (audit_tx, mut audit_rx) = mpsc::channel::<buzz_audit::NewAuditEntry>(1000);
         let audit_for_worker = audit_arc.clone();
         let audit_cancel = CancellationToken::new();
         let audit_cancel_worker = audit_cancel.clone();
-        let audit_worker_handle = tokio::spawn(async move {
-            let Some(audit_for_worker) = audit_for_worker else {
-                audit_cancel_worker.cancelled().await;
-                return;
-            };
-            // Normal operation: process entries as they arrive.
-            loop {
-                tokio::select! {
-                    entry = audit_rx.recv() => {
-                        match entry {
-                            Some(entry) => log_audit_entry(&audit_for_worker, entry).await,
-                            None => break, // channel closed
-                        }
-                    }
-                    _ = audit_cancel_worker.cancelled() => {
-                        // Close the receiver: rejects future sends and lets us
-                        // drain everything already buffered without a race.
-                        audit_rx.close();
-                        break;
-                    }
-                }
-            }
-            // Drain: recv() returns buffered entries, then None once empty.
-            let mut drained = 0u32;
-            while let Some(entry) = audit_rx.recv().await {
-                log_audit_entry(&audit_for_worker, entry).await;
-                drained += 1;
-            }
-            if drained > 0 {
-                tracing::info!(drained, "audit worker flushed remaining entries");
-            }
-            tracing::warn!("audit log worker exited (expected on shutdown)");
-        });
 
         let git_max_concurrent_ops = config.git_max_concurrent_ops;
         let media_max_concurrent_uploads = config.media_max_concurrent_uploads;
@@ -879,6 +882,7 @@ impl AppState {
             pubsub,
             auth: Arc::new(auth),
             corporate_identity,
+            authorization_runtime: Arc::new(authorization_runtime),
             search: search_arc,
             sub_registry: Arc::new(SubscriptionRegistry::new()),
             conn_manager: Arc::new(ConnectionManager::new()),
@@ -959,6 +963,37 @@ impl AppState {
             tracer: Arc::new(crate::conformance::NoopTracer),
             mesh: Arc::new(std::sync::OnceLock::new()),
         };
+        // State, including the immutable authorization runtime, is complete
+        // before the first background worker can observe or serve it.
+        let audit_worker_handle = tokio::spawn(async move {
+            let Some(audit_for_worker) = audit_for_worker else {
+                audit_cancel_worker.cancelled().await;
+                return;
+            };
+            loop {
+                tokio::select! {
+                    entry = audit_rx.recv() => {
+                        match entry {
+                            Some(entry) => log_audit_entry(&audit_for_worker, entry).await,
+                            None => break,
+                        }
+                    }
+                    _ = audit_cancel_worker.cancelled() => {
+                        audit_rx.close();
+                        break;
+                    }
+                }
+            }
+            let mut drained = 0u32;
+            while let Some(entry) = audit_rx.recv().await {
+                log_audit_entry(&audit_for_worker, entry).await;
+                drained += 1;
+            }
+            if drained > 0 {
+                tracing::info!(drained, "audit worker flushed remaining entries");
+            }
+            tracing::warn!("audit log worker exited (expected on shutdown)");
+        });
         (
             state,
             AuditShutdownHandle {

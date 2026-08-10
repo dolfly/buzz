@@ -12,9 +12,14 @@
 use std::sync::Arc;
 
 use axum::extract::ws::Message as WsMessage;
+use buzz_core::client_binding_bootstrap::ClientBindingScopeV1;
 use tracing::{debug, info, warn};
 
-use crate::connection::{AuthState, ConnectionState};
+use crate::authorization_runtime::{
+    ConnectionLocalStatusContract, ConnectionStatusSession, CurrentStatusAuthorization,
+    CurrentStatusEvidenceSource, ProviderFreeRuntimeMode, StatusCadence, StatusSessionError,
+};
+use crate::connection::{AuthState, ConnectionState, WebSocketStatusChannel};
 use crate::protocol::RelayMessage;
 use crate::state::AppState;
 
@@ -33,6 +38,115 @@ pub fn extract_auth_tag_json(event: &nostr::Event) -> Option<String> {
         return None; // NIP-OA spec: treat >1 auth tag as no valid auth tag
     }
     serde_json::to_string(first.as_slice()).ok()
+}
+
+fn status_activation_scope_matches(
+    verified_auth_event: &nostr::Event,
+    authorization: &CurrentStatusAuthorization,
+    tenant_domain: buzz_core::CommunityId,
+) -> bool {
+    let (authorization_domain, authorization_author) = authorization.domain_author();
+    authorization_domain == tenant_domain && authorization_author == verified_auth_event.pubkey
+}
+
+/// Activate current-only status after the caller has completed canonical
+/// scoped NIP-42 finalization and obtained a status authorization.
+///
+/// The legacy [`handle_auth`] path cannot call this function: it has no
+/// `BoundedAuthorizationLease` and therefore cannot construct
+/// [`CurrentStatusAuthorization`]. The connection manager cancels and joins
+/// any prior AUTH scope before this function delivers the replacement
+/// bootstrap, then becomes sole owner of the new task.
+pub async fn activate_client_binding_status<E>(
+    verified_auth_event: &nostr::Event,
+    authorization: CurrentStatusAuthorization,
+    evidence: E,
+    conn: Arc<ConnectionState>,
+    state: Arc<AppState>,
+) -> Result<tokio_util::sync::CancellationToken, StatusSessionError>
+where
+    E: CurrentStatusEvidenceSource + 'static,
+{
+    if state.authorization_runtime.mode() != ProviderFreeRuntimeMode::Enforce
+        || !state.authorization_runtime.is_ready()
+    {
+        conn.cancel.cancel();
+        return Err(StatusSessionError::EvidenceUnavailable);
+    }
+    if !status_activation_scope_matches(
+        verified_auth_event,
+        &authorization,
+        conn.tenant.community(),
+    ) {
+        conn.cancel.cancel();
+        return Err(StatusSessionError::EvidenceChanged);
+    }
+    if !conn.clear_client_binding_status_task().await {
+        conn.cancel.cancel();
+        return Err(StatusSessionError::DeliveryFailed);
+    }
+    let scope =
+        ClientBindingScopeV1::from_verified_auth_event(verified_auth_event).map_err(|_| {
+            conn.cancel.cancel();
+            StatusSessionError::ContractUnavailable
+        })?;
+    let advertised_relay_key = scope.relay_signer();
+    let channel = WebSocketStatusChannel::from_connection(&conn);
+    let bootstrap = channel
+        .deliver_bootstrap(
+            scope,
+            &authorization,
+            &state.relay_keypair,
+            chrono::Utc::now(),
+        )
+        .await?;
+    let contract =
+        ConnectionLocalStatusContract::new(state.relay_keypair.clone(), advertised_relay_key)
+            .inspect_err(|_| {
+                conn.cancel.cancel();
+            })?;
+    let cancel = conn.cancel.child_token();
+    let task_cancel = cancel.clone();
+    let session = ConnectionStatusSession::new(
+        evidence,
+        contract,
+        channel,
+        StatusCadence::production(),
+        bootstrap,
+    );
+    // The start gate makes task ownership structural: no 24244 work begins
+    // until the connection manager has installed this exact task. Replacement
+    // likewise joins the old task (and its withdrawal) before opening the gate.
+    let (start, started) = tokio::sync::oneshot::channel();
+    let join = tokio::spawn(async move {
+        let gate_cancel = task_cancel.clone();
+        tokio::select! {
+            _ = gate_cancel.cancelled() => {}
+            started = started => {
+                if started.is_ok() {
+                    if let Err(error) = session
+                        .run_until_cancelled(authorization, task_cancel)
+                        .await
+                    {
+                        tracing::warn!(error = %error, "current-binding status session closed fail-closed");
+                    }
+                }
+            }
+        }
+    });
+    if !conn
+        .replace_client_binding_status_task(cancel.clone(), join)
+        .await
+    {
+        conn.cancel.cancel();
+        return Err(StatusSessionError::DeliveryFailed);
+    }
+    if start.send(()).is_err() {
+        let _ = conn.clear_client_binding_status_task().await;
+        conn.cancel.cancel();
+        return Err(StatusSessionError::DeliveryFailed);
+    }
+    Ok(cancel)
 }
 
 /// Handle a NIP-42 AUTH message: verify the challenge response and transition
@@ -353,8 +467,12 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
 
 #[cfg(test)]
 mod tests {
-    use super::extract_auth_tag_json;
+    use super::{extract_auth_tag_json, status_activation_scope_matches};
+    use crate::authorization_runtime::CurrentStatusAuthorization;
+    use buzz_core::{AuthorizationLeaseFence, CanonicalCurrentBindingEvidence, CommunityId};
+    use chrono::Utc;
     use nostr::{EventBuilder, Keys, Kind, Tag};
+    use uuid::Uuid;
 
     /// Build a signed NIP-98 (kind 27235) event carrying the given tags. The
     /// `auth` tag lives inside the signed event exactly as the git and
@@ -403,5 +521,51 @@ mod tests {
             Tag::parse(["auth", b.as_str(), "", sig.as_str()]).unwrap(),
         ]);
         assert_eq!(extract_auth_tag_json(&event), None);
+    }
+
+    #[test]
+    fn status_activation_requires_exact_auth_author_and_tenant_domain() {
+        let author = Keys::generate();
+        let domain = CommunityId::from_uuid(Uuid::from_u128(1));
+        let now = Utc::now();
+        let evidence = CanonicalCurrentBindingEvidence::new(
+            domain,
+            author.public_key(),
+            Uuid::from_u128(2),
+            3,
+            4,
+            5,
+            6,
+            AuthorizationLeaseFence::from_bytes([7; 32]).unwrap(),
+            now,
+            now + chrono::Duration::seconds(120),
+        )
+        .unwrap();
+        let authorization = CurrentStatusAuthorization::from_test_parts(
+            &evidence,
+            now + chrono::Duration::seconds(120),
+        );
+        let auth_event = EventBuilder::new(Kind::Custom(22242), "")
+            .sign_with_keys(&author)
+            .unwrap();
+
+        assert!(status_activation_scope_matches(
+            &auth_event,
+            &authorization,
+            domain,
+        ));
+        assert!(!status_activation_scope_matches(
+            &auth_event,
+            &authorization,
+            CommunityId::from_uuid(Uuid::from_u128(9)),
+        ));
+        let other_author = EventBuilder::new(Kind::Custom(22242), "")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        assert!(!status_activation_scope_matches(
+            &other_author,
+            &authorization,
+            domain,
+        ));
     }
 }
