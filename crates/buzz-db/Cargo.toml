@@ -10,6 +10,10 @@ description = "Postgres event store and data access layer for Buzz"
 [dependencies]
 buzz-auth = { workspace = true }
 buzz-core = { workspace = true }
+async-trait = "0.1"
+axum        = { workspace = true }
+buzz-media = { workspace = true }
+dashmap     = { workspace = true }
 sqlx        = { workspace = true }
 tokio       = { workspace = true }
 serde       = { workspace = true }
@@ -23,6 +27,10 @@ thiserror   = { workspace = true }
 nostr       = { workspace = true }
 rand        = { workspace = true }
 metrics     = { workspace = true }
+s3 = { version = "0.37", package = "rust-s3", default-features = false, features = ["tokio-rustls-tls", "fail-on-err", "tags"] }
+
+[features]
+test-utils = []
 
 [dev-dependencies]
 tokio = { workspace = true }
