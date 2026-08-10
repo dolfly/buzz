@@ -906,6 +906,7 @@ dependencies = [
  "buzz-core",
  "chrono",
  "hex",
+ "hmac 0.13.0",
  "jsonwebtoken",
  "nostr",
  "rand 0.10.1",
@@ -1006,6 +1007,7 @@ dependencies = [
 name = "buzz-db"
 version = "0.1.0"
 dependencies = [
+ "buzz-auth",
  "buzz-core",
  "chrono",
  "hex",
