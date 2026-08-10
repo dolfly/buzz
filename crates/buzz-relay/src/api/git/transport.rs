@@ -1156,8 +1156,7 @@ pub async fn receive_pack(
     // would be a distributed-lock service we explicitly don't want.
     // If contention shows up in metrics, the fix is a short local
     // best-effort lock as a *latency optimization*, never a correctness
-    // dependency. (Eva's call, on record in #proj-git-on-s3 with the
-    // ParentState seam review.)
+    // dependency. This follows the reviewed ParentState ownership contract.
 
     // Hydrate parent state + workspace in one round-trip. ParentState
     // travels with the workspace into finalize_push so the CAS predicates
