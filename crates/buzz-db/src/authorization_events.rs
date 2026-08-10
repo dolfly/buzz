@@ -541,6 +541,16 @@ impl AuthorizationEventActor {
     pub const fn authority_loss_target(&self) -> Option<AuthorizationAuthorityLossTarget> {
         self.authority_loss_target
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_direct(community_id: CommunityId) -> Self {
+        local_actor(
+            AuthorizationActorKind::Direct,
+            community_id,
+            &[b"protected-version-test"],
+            None,
+        )
+    }
 }
 
 const fn proof_transport_code(transport: ProofTransport) -> i16 {

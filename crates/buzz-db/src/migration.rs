@@ -348,6 +348,7 @@ mod tests {
             "push_gateway_delivery_request_replays",
             "product_feedback",
             "replica_heartbeat",
+            "authorization_proxy_nonce_claims",
         ] {
             if normalized[insert_pos..].contains(&format!("'{value}'")) {
                 globals.insert(value.to_owned());
@@ -502,12 +503,30 @@ mod tests {
             && constraint.columns == ["delivered_at", "id"]
     }
 
+    fn is_replaced_publication_sequence_unique(sql: &str, constraint: &ConstraintLint) -> bool {
+        if constraint.table != "protected_publication_projection_outbox"
+            || constraint.kind != ConstraintKind::Unique
+            || constraint.columns != ["publication_sequence"]
+        {
+            return false;
+        }
+
+        let normalized = normalize_sql(sql);
+        normalized.contains(
+            "drop constraint protected_publication_projection_outbo_publication_sequence_key",
+        ) && normalized.contains(
+            "add constraint protected_publication_projection_outbo_publication_sequence_key unique (community_id, publication_sequence)",
+        )
+    }
+
     fn scoped_constraint_violations(sql: &str) -> Vec<ConstraintLint> {
         let scoped_tables = scoped_tables(sql);
         scoped_constraint_lints(sql, &scoped_tables)
             .into_iter()
             .filter(|constraint| {
-                if is_allowed_partition_primary_key_exception(constraint) {
+                if is_allowed_partition_primary_key_exception(constraint)
+                    || is_replaced_publication_sequence_unique(sql, constraint)
+                {
                     return false;
                 }
                 constraint.columns.first().map(String::as_str) != Some("community_id")
@@ -561,7 +580,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 34);
+        assert_eq!(migrations.len(), 35);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1038,6 +1057,30 @@ mod tests {
                 "migration 0036 missing Invitation object-kind closure: {required}",
             );
         }
+
+        assert_eq!(migrations[34].version, 37);
+        let invalidation_restore_runtime = migrations[34].sql.as_str();
+        for required in [
+            "authorization_invalidation_domains",
+            "authorization_operation_version_delta_manifests",
+            "client_status_revisions",
+            "max_events_per_domain BETWEEN 1 AND 1000000",
+            "max_bytes_per_domain BETWEEN 1 AND 4294967296",
+            "max_envelope_bytes BETWEEN 1 AND 65536",
+            "ADD GENERATED ALWAYS AS IDENTITY",
+            "pg_get_serial_sequence",
+            "UNIQUE (community_id, publication_sequence)",
+            "nip_fi_0037_ephemeral_status_required",
+        ] {
+            assert!(
+                invalidation_restore_runtime.contains(required),
+                "migration 0037 missing runtime catalog closure: {required}",
+            );
+        }
+        assert!(
+            !invalidation_restore_runtime.contains("CREATE TABLE client_status_revisions"),
+            "migration 0037 must keep client status connection-local",
+        );
     }
 
     #[test]
@@ -1280,7 +1323,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(36));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(37));
     }
 
     #[tokio::test]

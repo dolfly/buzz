@@ -207,9 +207,9 @@ CREATE TABLE IF NOT EXISTS authorization_event_capacity (
     CONSTRAINT authorization_event_capacity_check2 CHECK (retained_envelope_bytes <= max_bytes_per_domain),
     CONSTRAINT authorization_event_capacity_failure_code_check CHECK (failure_code IS NULL OR (failure_code IN (1, 2, 3))),
     CONSTRAINT authorization_event_capacity_health_state_check CHECK (health_state IN (1, 2)),
-    CONSTRAINT authorization_event_capacity_max_bytes CHECK (max_bytes_per_domain >= 1 AND max_bytes_per_domain <= 16777216),
-    CONSTRAINT authorization_event_capacity_max_envelope CHECK (max_envelope_bytes >= 1 AND max_envelope_bytes <= 16384),
-    CONSTRAINT authorization_event_capacity_max_events CHECK (max_events_per_domain >= 1 AND max_events_per_domain <= 10000),
+    CONSTRAINT authorization_event_capacity_max_bytes CHECK (max_bytes_per_domain >= 1 AND max_bytes_per_domain <= 4294967296),
+    CONSTRAINT authorization_event_capacity_max_envelope CHECK (max_envelope_bytes >= 1 AND max_envelope_bytes <= 65536),
+    CONSTRAINT authorization_event_capacity_max_events CHECK (max_events_per_domain >= 1 AND max_events_per_domain <= 1000000),
     CONSTRAINT authorization_event_capacity_retained_envelope_bytes_check CHECK (retained_envelope_bytes >= 0),
     CONSTRAINT authorization_event_capacity_retained_event_count_check CHECK (retained_event_count >= 0)
 );
@@ -349,7 +349,7 @@ CREATE TABLE IF NOT EXISTS authorization_events (
     CONSTRAINT authorization_events_event_kind_check CHECK (event_kind IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14)),
     CONSTRAINT authorization_events_operation_id_check CHECK (operation_id <> '00000000-0000-0000-0000-000000000000'::uuid),
     CONSTRAINT authorization_events_outcome_code_check CHECK (outcome_code IN (1, 2, 3, 4, 5)),
-    CONSTRAINT authorization_events_reason_code_check CHECK (reason_code IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)),
+    CONSTRAINT authorization_events_reason_code_check CHECK (reason_code IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)),
     CONSTRAINT authorization_events_request_fingerprint_check CHECK (request_fingerprint IS NULL OR octet_length(request_fingerprint) = 32),
     CONSTRAINT authorization_events_schema_version_check CHECK (schema_version = 1),
     CONSTRAINT authorization_events_subject_fingerprint_check CHECK (subject_fingerprint IS NULL OR octet_length(subject_fingerprint) = 32)
@@ -454,6 +454,23 @@ CREATE TABLE IF NOT EXISTS authorization_operation_version_deltas (
     CONSTRAINT authorization_operation_version_deltas_component_digest_check CHECK (octet_length(component_digest) = 32),
     CONSTRAINT authorization_operation_version_deltas_component_key_check CHECK (octet_length(component_key) = 32),
     CONSTRAINT authorization_operation_version_deltas_component_kind_check CHECK (component_kind IN (1, 2, 3, 4, 6, 7))
+);
+
+--
+-- Name: authorization_proxy_nonce_claims; Type: TABLE; Schema: -; Owner: -
+--
+
+CREATE TABLE IF NOT EXISTS authorization_proxy_nonce_claims (
+    authorization_domain uuid,
+    claim_kind smallint,
+    claim_key bytea,
+    committed_at timestamptz DEFAULT transaction_timestamp() NOT NULL,
+    retain_until timestamptz NOT NULL,
+    CONSTRAINT authorization_proxy_nonce_claims_pkey PRIMARY KEY (authorization_domain, claim_kind, claim_key),
+    CONSTRAINT authorization_proxy_nonce_claims_authorization_domain_fkey FOREIGN KEY (authorization_domain) REFERENCES communities (id),
+    CONSTRAINT authorization_proxy_nonce_claims_check CHECK (committed_at < retain_until),
+    CONSTRAINT authorization_proxy_nonce_claims_claim_key_check CHECK (octet_length(claim_key) = 32 AND claim_key <> decode(repeat('00'::text, 32), 'hex'::text)),
+    CONSTRAINT authorization_proxy_nonce_claims_claim_kind_check CHECK (claim_kind = 1)
 );
 
 --
@@ -1803,6 +1820,75 @@ CREATE INDEX IF NOT EXISTS idx_product_feedback_community_received ON product_fe
 CREATE INDEX IF NOT EXISTS idx_product_feedback_received ON product_feedback (received_at DESC, id);
 
 --
+-- Name: protected_publication_projection_outbox; Type: TABLE; Schema: -; Owner: -
+--
+
+CREATE TABLE IF NOT EXISTS protected_publication_projection_outbox (
+    community_id uuid,
+    operation_id uuid,
+    request_fingerprint bytea NOT NULL,
+    publication_result_digest bytea NOT NULL,
+    object_kind smallint NOT NULL,
+    object_key bytea NOT NULL,
+    application_type bytea NOT NULL,
+    application_version smallint NOT NULL,
+    application_effect_digest bytea NOT NULL,
+    projection_kind smallint,
+    projection_key text NOT NULL,
+    staged_object_key text NOT NULL,
+    payload_digest bytea NOT NULL,
+    delivery_state smallint DEFAULT 1 NOT NULL,
+    attempt_count bigint DEFAULT 0 NOT NULL,
+    next_attempt_at timestamptz DEFAULT transaction_timestamp() NOT NULL,
+    last_attempt_at timestamptz,
+    delivered_at timestamptz,
+    failure_code smallint DEFAULT 0 NOT NULL,
+    created_at timestamptz DEFAULT transaction_timestamp() NOT NULL,
+    publication_sequence bigint GENERATED ALWAYS AS IDENTITY,
+    CONSTRAINT protected_publication_projection_outbox_pkey PRIMARY KEY (community_id, operation_id, projection_kind),
+    CONSTRAINT protected_publication_projection_outbo_publication_sequence_key UNIQUE (community_id, publication_sequence),
+    CONSTRAINT protected_publication_project_community_id_operation_id_re_fkey FOREIGN KEY (community_id, operation_id, request_fingerprint) REFERENCES authorization_operation_receipts (community_id, operation_id, request_fingerprint) DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT protected_publication_projection_outbox_community_id_fkey FOREIGN KEY (community_id) REFERENCES communities (id),
+    CONSTRAINT protected_publication_projectio_application_effect_digest_check CHECK (octet_length(application_effect_digest) = 32 AND application_effect_digest <> decode(repeat('00'::text, 32), 'hex'::text)),
+    CONSTRAINT protected_publication_projectio_publication_result_digest_check CHECK (octet_length(publication_result_digest) = 32 AND publication_result_digest <> decode(repeat('00'::text, 32), 'hex'::text)),
+    CONSTRAINT protected_publication_projection_outb_application_version_check CHECK (application_version > 0),
+    CONSTRAINT protected_publication_projection_outb_request_fingerprint_check CHECK (octet_length(request_fingerprint) = 32 AND request_fingerprint <> decode(repeat('00'::text, 32), 'hex'::text)),
+    CONSTRAINT protected_publication_projection_outbox_application_type_check CHECK (octet_length(application_type) = 32 AND application_type <> decode(repeat('00'::text, 32), 'hex'::text)),
+    CONSTRAINT protected_publication_projection_outbox_attempt_count_check CHECK (attempt_count >= 0),
+    CONSTRAINT protected_publication_projection_outbox_check CHECK ((attempt_count = 0) = (last_attempt_at IS NULL)),
+    CONSTRAINT protected_publication_projection_outbox_check1 CHECK (last_attempt_at IS NULL OR last_attempt_at >= created_at),
+    CONSTRAINT protected_publication_projection_outbox_check2 CHECK (delivered_at IS NULL OR delivered_at >= created_at),
+    CONSTRAINT protected_publication_projection_outbox_check3 CHECK ((delivery_state = 1 AND delivered_at IS NULL AND failure_code IN (0, 1, 2)) OR (delivery_state = 2 AND delivered_at IS NOT NULL AND failure_code = 0) OR (delivery_state = 3 AND delivered_at IS NULL AND failure_code >= 3 AND failure_code <= 6)),
+    CONSTRAINT protected_publication_projection_outbox_delivery_state_check CHECK (delivery_state IN (1, 2, 3)),
+    CONSTRAINT protected_publication_projection_outbox_failure_code_check CHECK (failure_code >= 0 AND failure_code <= 6),
+    CONSTRAINT protected_publication_projection_outbox_object_key_check CHECK (octet_length(object_key) = 32 AND object_key <> decode(repeat('00'::text, 32), 'hex'::text)),
+    CONSTRAINT protected_publication_projection_outbox_object_kind_check CHECK (object_kind IN (3, 4)),
+    CONSTRAINT protected_publication_projection_outbox_operation_id_check CHECK (operation_id <> '00000000-0000-0000-0000-000000000000'::uuid),
+    CONSTRAINT protected_publication_projection_outbox_payload_digest_check CHECK (octet_length(payload_digest) = 32 AND payload_digest <> decode(repeat('00'::text, 32), 'hex'::text)),
+    CONSTRAINT protected_publication_projection_outbox_projection_key_check CHECK (octet_length(projection_key) >= 1 AND octet_length(projection_key) <= 2048),
+    CONSTRAINT protected_publication_projection_outbox_projection_kind_check CHECK (projection_kind IN (1, 2, 3)),
+    CONSTRAINT protected_publication_projection_outbox_staged_object_key_check CHECK (octet_length(staged_object_key) >= 1 AND octet_length(staged_object_key) <= 2048)
+);
+
+--
+-- Name: protected_publication_projection_outbox_active_target; Type: INDEX; Schema: -; Owner: -
+--
+
+CREATE UNIQUE INDEX IF NOT EXISTS protected_publication_projection_outbox_active_target ON protected_publication_projection_outbox (community_id, projection_kind, projection_key) WHERE (delivery_state = 1);
+
+--
+-- Name: protected_publication_projection_outbox_pending; Type: INDEX; Schema: -; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS protected_publication_projection_outbox_pending ON protected_publication_projection_outbox (delivery_state, next_attempt_at, community_id, operation_id) WHERE (delivery_state = 1);
+
+--
+-- Name: protected_publication_projection_outbox_target_order; Type: INDEX; Schema: -; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS protected_publication_projection_outbox_target_order ON protected_publication_projection_outbox (community_id, object_kind, object_key, projection_kind, projection_key, publication_sequence);
+
+--
 -- Name: pubkey_allowlist; Type: TABLE; Schema: -; Owner: -
 --
 
@@ -3017,6 +3103,45 @@ END;
 $$;
 
 --
+-- Name: authorization_proxy_nonce_claim_retention_v1(); Type: FUNCTION; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE FUNCTION authorization_proxy_nonce_claim_retention_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+BEGIN
+    IF transaction_timestamp() <= OLD.retain_until THEN
+        RAISE EXCEPTION 'trusted-proxy nonce claim retention is still active'
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'authorization_proxy_nonce_claim_retention';
+    END IF;
+    RETURN OLD;
+END;
+$$;
+
+--
+-- Name: authorization_proxy_nonce_claim_stamp_v1(); Type: FUNCTION; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE FUNCTION authorization_proxy_nonce_claim_stamp_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+BEGIN
+    NEW.committed_at := transaction_timestamp();
+    IF NEW.retain_until <= NEW.committed_at THEN
+        RAISE EXCEPTION 'trusted-proxy nonce claim is already expired'
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'authorization_proxy_nonce_claim_expired';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+--
 -- Name: channels_community_id_immutable(); Type: FUNCTION; Schema: -; Owner: -
 --
 
@@ -3826,6 +3951,148 @@ END;
 $$;
 
 --
+-- Name: protected_publication_projection_insert_guard_v1(); Type: FUNCTION; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE FUNCTION protected_publication_projection_insert_guard_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+BEGIN
+    IF NEW.delivery_state <> 1
+        OR NEW.attempt_count <> 0
+        OR NEW.last_attempt_at IS NOT NULL
+        OR NEW.delivered_at IS NOT NULL
+        OR NEW.failure_code <> 0
+    THEN
+        RAISE EXCEPTION 'protected publication projection must start pending'
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'protected_publication_projection_initial_state';
+    END IF;
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended(
+            jsonb_build_array(
+                'buzz:nip-fi:protected-publication-projection:v1',
+                NEW.community_id::TEXT,
+                NEW.object_kind,
+                encode(NEW.object_key, 'hex'),
+                NEW.projection_kind,
+                NEW.projection_key
+            )::TEXT,
+            0
+        )
+    );
+    NEW.publication_sequence := nextval(
+        pg_get_serial_sequence(
+            'protected_publication_projection_outbox',
+            'publication_sequence'
+        )::regclass
+    );
+    NEW.created_at := transaction_timestamp();
+    NEW.next_attempt_at := transaction_timestamp();
+    RETURN NEW;
+END;
+$$;
+
+--
+-- Name: protected_publication_projection_receipt_guard_v1(); Type: FUNCTION; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE FUNCTION protected_publication_projection_receipt_guard_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM authorization_operation_receipts receipt
+        JOIN authorization_admission_results admission
+          ON admission.community_id = receipt.community_id
+         AND admission.operation_id = receipt.operation_id
+         AND admission.request_fingerprint = receipt.request_fingerprint
+        WHERE receipt.community_id = NEW.community_id
+          AND receipt.operation_id = NEW.operation_id
+          AND receipt.request_fingerprint = NEW.request_fingerprint
+          AND receipt.operation_kind IN (1, 11)
+          AND receipt.outcome_code = 1
+          AND admission.object_kind = NEW.object_kind
+          AND admission.object_key = NEW.object_key
+          AND admission.application_type = NEW.application_type
+          AND admission.application_version = NEW.application_version
+          AND admission.application_effect_digest = NEW.application_effect_digest
+          AND admission.application_result_digest = NEW.publication_result_digest
+    ) THEN
+        RAISE EXCEPTION 'protected publication projection requires exact applied receipt'
+            USING ERRCODE = 'foreign_key_violation',
+                  CONSTRAINT = 'protected_publication_projection_receipt';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+--
+-- Name: protected_publication_projection_state_guard_v1(); Type: FUNCTION; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE FUNCTION protected_publication_projection_state_guard_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+BEGIN
+    IF NEW.community_id IS DISTINCT FROM OLD.community_id
+        OR NEW.operation_id IS DISTINCT FROM OLD.operation_id
+        OR NEW.request_fingerprint IS DISTINCT FROM OLD.request_fingerprint
+        OR NEW.publication_result_digest IS DISTINCT FROM OLD.publication_result_digest
+        OR NEW.object_kind IS DISTINCT FROM OLD.object_kind
+        OR NEW.object_key IS DISTINCT FROM OLD.object_key
+        OR NEW.application_type IS DISTINCT FROM OLD.application_type
+        OR NEW.application_version IS DISTINCT FROM OLD.application_version
+        OR NEW.application_effect_digest IS DISTINCT FROM OLD.application_effect_digest
+        OR NEW.projection_kind IS DISTINCT FROM OLD.projection_kind
+        OR NEW.projection_key IS DISTINCT FROM OLD.projection_key
+        OR NEW.staged_object_key IS DISTINCT FROM OLD.staged_object_key
+        OR NEW.payload_digest IS DISTINCT FROM OLD.payload_digest
+        OR NEW.created_at IS DISTINCT FROM OLD.created_at
+        OR NEW.publication_sequence IS DISTINCT FROM OLD.publication_sequence
+        OR OLD.delivery_state <> 1
+        OR NEW.delivery_state NOT IN (1, 2, 3)
+        OR NEW.attempt_count <> OLD.attempt_count + 1
+        OR NEW.next_attempt_at < OLD.next_attempt_at
+        OR (NEW.delivery_state = 1 AND NEW.failure_code NOT IN (1, 2))
+        OR (
+            NEW.delivery_state = 2
+            AND EXISTS (
+                SELECT 1
+                FROM protected_publication_projection_outbox earlier
+                WHERE earlier.community_id = OLD.community_id
+                  AND earlier.object_kind = OLD.object_kind
+                  AND earlier.object_key = OLD.object_key
+                  AND earlier.projection_kind = OLD.projection_kind
+                  AND earlier.projection_key = OLD.projection_key
+                  AND earlier.publication_sequence < OLD.publication_sequence
+                  AND earlier.delivery_state = 1
+            )
+        )
+    THEN
+        RAISE EXCEPTION 'protected publication projection transition is invalid'
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'protected_publication_projection_transition';
+    END IF;
+    NEW.last_attempt_at := transaction_timestamp();
+    IF NEW.delivery_state = 2 THEN
+        NEW.delivered_at := transaction_timestamp();
+        NEW.failure_code := 0;
+    ELSE
+        NEW.delivered_at := NULL;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+--
 -- Name: purge_soft_deleted_buzz_mesh_status(); Type: FUNCTION; Schema: -; Owner: -
 --
 
@@ -4194,6 +4461,42 @@ CREATE OR REPLACE TRIGGER authorization_operation_version_deltas_no_truncate
     BEFORE TRUNCATE ON authorization_operation_version_deltas
     FOR EACH STATEMENT
     EXECUTE FUNCTION nip_fi_reject_truncate_v1();
+
+--
+-- Name: authorization_proxy_nonce_claims_immutable; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER authorization_proxy_nonce_claims_immutable
+    BEFORE UPDATE ON authorization_proxy_nonce_claims
+    FOR EACH ROW
+    EXECUTE FUNCTION nip_fi_reject_row_mutation_v1();
+
+--
+-- Name: authorization_proxy_nonce_claims_no_truncate; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER authorization_proxy_nonce_claims_no_truncate
+    BEFORE TRUNCATE ON authorization_proxy_nonce_claims
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION nip_fi_reject_truncate_v1();
+
+--
+-- Name: authorization_proxy_nonce_claims_retained; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER authorization_proxy_nonce_claims_retained
+    BEFORE DELETE ON authorization_proxy_nonce_claims
+    FOR EACH ROW
+    EXECUTE FUNCTION authorization_proxy_nonce_claim_retention_v1();
+
+--
+-- Name: authorization_proxy_nonce_claims_stamp; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER authorization_proxy_nonce_claims_stamp
+    BEFORE INSERT ON authorization_proxy_nonce_claims
+    FOR EACH ROW
+    EXECUTE FUNCTION authorization_proxy_nonce_claim_stamp_v1();
 
 --
 -- Name: events_created_at_floor; Type: TRIGGER; Schema: -; Owner: -
@@ -4697,6 +5000,52 @@ CREATE OR REPLACE TRIGGER protected_object_authority_strict_replacement
     BEFORE UPDATE ON protected_object_authority
     FOR EACH ROW
     EXECUTE FUNCTION protected_object_authority_guard_v1();
+
+--
+-- Name: protected_publication_projection_initial_state; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER protected_publication_projection_initial_state
+    BEFORE INSERT ON protected_publication_projection_outbox
+    FOR EACH ROW
+    EXECUTE FUNCTION protected_publication_projection_insert_guard_v1();
+
+--
+-- Name: protected_publication_projection_no_delete; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER protected_publication_projection_no_delete
+    BEFORE DELETE ON protected_publication_projection_outbox
+    FOR EACH ROW
+    EXECUTE FUNCTION nip_fi_reject_row_mutation_v1();
+
+--
+-- Name: protected_publication_projection_no_truncate; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER protected_publication_projection_no_truncate
+    BEFORE TRUNCATE ON protected_publication_projection_outbox
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION nip_fi_reject_truncate_v1();
+
+--
+-- Name: protected_publication_projection_receipt; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER protected_publication_projection_receipt
+    AFTER INSERT ON protected_publication_projection_outbox
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW
+    EXECUTE FUNCTION protected_publication_projection_receipt_guard_v1();
+
+--
+-- Name: protected_publication_projection_state; Type: TRIGGER; Schema: -; Owner: -
+--
+
+CREATE OR REPLACE TRIGGER protected_publication_projection_state
+    BEFORE UPDATE ON protected_publication_projection_outbox
+    FOR EACH ROW
+    EXECUTE FUNCTION protected_publication_projection_state_guard_v1();
 
 --
 -- Name: trg_channels_community_id_immutable; Type: TRIGGER; Schema: -; Owner: -
