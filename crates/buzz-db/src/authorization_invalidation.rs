@@ -494,7 +494,7 @@ impl AuthorizationInvalidationAdvance {
     }
 
     /// Exact object evidence refenced before invalidation locking.
-    #[allow(dead_code)] // Consumed by the S3 admission-loss integration child.
+    #[allow(dead_code)] // Consumed by canonical admission-loss integration.
     pub(crate) fn authority_objects(&self) -> &[AuthorizationAuthorityObjectEvidence] {
         &self.authority_objects
     }
@@ -513,7 +513,7 @@ impl fmt::Debug for AuthorizationInvalidationAdvance {
 
 /// Advance invalidation for one exact local admission loss inside the
 /// lifecycle transaction that owns the receipt, history, audit, and manifest.
-#[allow(dead_code)] // Consumed by the review-pending S3 lifecycle overlay.
+#[allow(dead_code)] // Consumed by lifecycle integration.
 pub(crate) async fn apply_admission_loss_invalidation_tx(
     transaction: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -585,7 +585,7 @@ impl Db {
 
     /// Atomically advance one domain generation, selector floors, canonical
     /// receipt/event, and exact operation version manifest.
-    #[allow(dead_code)] // Called by the verified S5 mutation adapter.
+    #[allow(dead_code)] // Called by the verified mutation adapter.
     pub(crate) async fn apply_authorization_invalidation(
         &self,
         request: AuthorizationInvalidationRequest,

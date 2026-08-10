@@ -3039,7 +3039,6 @@ fn component_kind_from_i16(
         2 => Ok(AuthorizationVersionComponentKind::Policy),
         3 => Ok(AuthorizationVersionComponentKind::InvalidationGeneration),
         4 => Ok(AuthorizationVersionComponentKind::AuthorityEpoch),
-        5 => Ok(AuthorizationVersionComponentKind::ClientStatusRevision),
         6 => Ok(AuthorizationVersionComponentKind::DelegatedRelationship),
         7 => Ok(AuthorizationVersionComponentKind::LifecycleSelector),
         _ => Err(OperationRestoreError::InvalidAttribution),
@@ -4608,7 +4607,6 @@ mod tests {
             AuthorizationVersionComponentKind::Policy,
             AuthorizationVersionComponentKind::InvalidationGeneration,
             AuthorizationVersionComponentKind::AuthorityEpoch,
-            AuthorizationVersionComponentKind::ClientStatusRevision,
             AuthorizationVersionComponentKind::DelegatedRelationship,
             AuthorizationVersionComponentKind::LifecycleSelector,
         ];

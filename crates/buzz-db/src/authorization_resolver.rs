@@ -22,8 +22,6 @@ use crate::{
     Db, DbError,
 };
 
-const STATUS_AUTHORITY_OBJECT_KIND: i16 = 7;
-
 /// Concrete provider-free PostgreSQL local binding resolver.
 #[derive(Clone)]
 pub struct PostgresLocalBindingResolver {
@@ -60,9 +58,6 @@ pub enum AuthorizationResolverError {
     /// A frozen cross-lane trusted constructor or mutation seam is not installed.
     #[error("local binding resolver contract is unavailable")]
     ContractUnavailable,
-    /// Rechecked status evidence changed or expired.
-    #[error("current binding evidence is stale")]
-    StatusEvidenceStale,
     /// Delegated protected transport has no reviewed positive authority source.
     #[error("delegated protected authorization is unavailable")]
     DelegationAuthorityUnavailable,
@@ -308,21 +303,16 @@ impl LocalBindingResolver for PostgresLocalBindingResolver {
         &'a self,
         request: &'a CurrentBindingStatusEvidenceRequest,
     ) -> std::result::Result<CanonicalCurrentBindingEvidence, Self::Error> {
-        self.db
-            .current_binding_status_evidence(request)
-            .await
-            .map_err(Into::into)
+        let _ = request;
+        Err(AuthorizationResolverError::ContractUnavailable)
     }
 
     async fn recheck_current_status_evidence<'a>(
         &'a self,
         evidence: &'a CanonicalCurrentBindingEvidence,
     ) -> std::result::Result<CanonicalCurrentBindingEvidence, Self::Error> {
-        let current = self
-            .db
-            .recheck_current_binding_status_evidence(evidence)
-            .await?;
-        current.ok_or(AuthorizationResolverError::StatusEvidenceStale)
+        let _ = evidence;
+        Err(AuthorizationResolverError::ContractUnavailable)
     }
 }
 
@@ -395,145 +385,6 @@ fn parse_active_binding(
     })
 }
 
-impl Db {
-    /// Read privacy-safe current-binding evidence without identity mutation.
-    pub async fn current_binding_status_evidence(
-        &self,
-        request: &CurrentBindingStatusEvidenceRequest,
-    ) -> crate::Result<CanonicalCurrentBindingEvidence> {
-        let object_key = client_status_authority_object_key(
-            request.authorization_domain(),
-            request.event_author_pubkey(),
-        );
-        let row = sqlx::query(
-            "SELECT b.binding_id,b.binding_version,b.policy_revision, \
-                    d.current_generation,a.authority_epoch,a.fence, \
-                    clock_timestamp() AS observed_at, \
-                    LEAST(clock_timestamp() + INTERVAL '300 seconds', \
-                          COALESCE(b.expires_at, clock_timestamp() + INTERVAL '300 seconds'), \
-                          COALESCE(p.expires_at, clock_timestamp() + INTERVAL '300 seconds')) \
-                        AS fresh_until \
-             FROM identity_bindings b \
-             JOIN identity_enrollment_policies p \
-               ON p.community_id=b.community_id AND p.policy_revision=b.policy_revision \
-             JOIN authorization_invalidation_domains d ON d.community_id=b.community_id \
-             JOIN authorization_authority_epochs a \
-               ON a.community_id=b.community_id AND a.object_kind=$3 AND a.object_key=$4 \
-             WHERE b.community_id=$1 AND b.event_author_pubkey=$2 AND b.binding_state=1 \
-               AND (b.expires_at IS NULL OR b.expires_at > clock_timestamp()) \
-               AND p.effective_at <= clock_timestamp() \
-               AND (p.expires_at IS NULL OR p.expires_at > clock_timestamp())",
-        )
-        .bind(request.authorization_domain().as_uuid())
-        .bind(request.event_author_pubkey().to_bytes().as_slice())
-        .bind(STATUS_AUTHORITY_OBJECT_KIND)
-        .bind(object_key.as_slice())
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| DbError::NotFound("current binding status evidence".to_owned()))?;
-        status_evidence_from_row(request, row)
-    }
-
-    /// Atomically recheck every stored coordinate of current-binding evidence.
-    ///
-    /// A changed tuple returns `Ok(None)` so presentation can be withheld
-    /// without changing authorization state.
-    pub async fn recheck_current_binding_status_evidence(
-        &self,
-        evidence: &CanonicalCurrentBindingEvidence,
-    ) -> crate::Result<Option<CanonicalCurrentBindingEvidence>> {
-        let object_key = client_status_authority_object_key(
-            evidence.authorization_domain(),
-            evidence.event_author_pubkey(),
-        );
-        let mut transaction = self.pool.begin().await?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-            .execute(&mut *transaction)
-            .await?;
-        let row = sqlx::query(
-            "SELECT b.binding_id,b.binding_version,b.policy_revision, \
-                    d.current_generation,a.authority_epoch,a.fence,clock_timestamp() AS now \
-             FROM identity_bindings b \
-             JOIN identity_enrollment_policies p \
-               ON p.community_id=b.community_id AND p.policy_revision=b.policy_revision \
-             JOIN authorization_invalidation_domains d ON d.community_id=b.community_id \
-             JOIN authorization_authority_epochs a \
-               ON a.community_id=b.community_id AND a.object_kind=$3 AND a.object_key=$4 \
-             WHERE b.community_id=$1 AND b.event_author_pubkey=$2 AND b.binding_state=1 \
-               AND (b.expires_at IS NULL OR b.expires_at > clock_timestamp()) \
-               AND p.effective_at <= clock_timestamp() \
-               AND (p.expires_at IS NULL OR p.expires_at > clock_timestamp())",
-        )
-        .bind(evidence.authorization_domain().as_uuid())
-        .bind(evidence.event_author_pubkey().to_bytes().as_slice())
-        .bind(STATUS_AUTHORITY_OBJECT_KIND)
-        .bind(object_key.as_slice())
-        .fetch_optional(&mut *transaction)
-        .await?;
-        transaction.commit().await?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let binding_version = database_u64(row.try_get("binding_version")?, "binding version")?;
-        let policy_revision = database_u64(row.try_get("policy_revision")?, "policy revision")?;
-        let invalidation_generation = database_u64(
-            row.try_get("current_generation")?,
-            "invalidation generation",
-        )?;
-        let authority_epoch = database_u64(row.try_get("authority_epoch")?, "authority epoch")?;
-        let fence =
-            AuthorizationLeaseFence::from_bytes(bytes32(row.try_get("fence")?, "fence")?)
-                .map_err(|_| DbError::InvalidData("authorization fence is invalid".to_owned()))?;
-        let now: DateTime<Utc> = row.try_get("now")?;
-        let exact = row.try_get::<uuid::Uuid, _>("binding_id")? == evidence.binding_id()
-            && binding_version == evidence.binding_version()
-            && policy_revision == evidence.policy_revision()
-            && invalidation_generation == evidence.invalidation_generation()
-            && authority_epoch == evidence.authority_epoch()
-            && fence == evidence.fence()
-            && evidence.is_fresh_at(now);
-        Ok(exact.then(|| evidence.clone()))
-    }
-}
-
-fn status_evidence_from_row(
-    request: &CurrentBindingStatusEvidenceRequest,
-    row: sqlx::postgres::PgRow,
-) -> crate::Result<CanonicalCurrentBindingEvidence> {
-    let fence = AuthorizationLeaseFence::from_bytes(bytes32(row.try_get("fence")?, "fence")?)
-        .map_err(|_| DbError::InvalidData("authorization fence is invalid".to_owned()))?;
-    CanonicalCurrentBindingEvidence::new(
-        request.authorization_domain(),
-        request.event_author_pubkey(),
-        row.try_get("binding_id")?,
-        database_u64(row.try_get("binding_version")?, "binding version")?,
-        database_u64(row.try_get("policy_revision")?, "policy revision")?,
-        database_u64(
-            row.try_get("current_generation")?,
-            "invalidation generation",
-        )?,
-        database_u64(row.try_get("authority_epoch")?, "authority epoch")?,
-        fence,
-        row.try_get("observed_at")?,
-        row.try_get("fresh_until")?,
-    )
-    .map_err(|_| DbError::InvalidData("current binding evidence is invalid".to_owned()))
-}
-
-/// Canonical protected-object coordinate for one status author.
-pub fn client_status_authority_object_key(
-    community_id: CommunityId,
-    event_author_pubkey: PublicKey,
-) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(b"buzz:client-binding-status-authority:v1");
-    digest.update((16_u64).to_be_bytes());
-    digest.update(community_id.as_uuid().as_bytes());
-    digest.update((32_u64).to_be_bytes());
-    digest.update(event_author_pubkey.to_bytes());
-    digest.finalize().into()
-}
-
 fn bytes32(value: Vec<u8>, name: &str) -> crate::Result<[u8; 32]> {
     value
         .try_into()
@@ -574,19 +425,6 @@ fn initial_publication_fence(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr::Keys;
-    use uuid::Uuid;
-
-    #[test]
-    fn status_authority_keys_are_domain_and_author_bound() {
-        let author = Keys::generate().public_key();
-        let domain_a = CommunityId::from_uuid(Uuid::from_u128(1));
-        let domain_b = CommunityId::from_uuid(Uuid::from_u128(2));
-        assert_ne!(
-            client_status_authority_object_key(domain_a, author),
-            client_status_authority_object_key(domain_b, author)
-        );
-    }
 
     #[tokio::test]
     async fn concrete_resolver_is_redacted_and_declares_owner_bound_delegation() {

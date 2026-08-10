@@ -46,7 +46,9 @@ fn authorization_operation_fence_key(
     digest.update(operation_id.as_bytes());
     digest.update(request_fingerprint);
     let digest: [u8; 32] = digest.finalize().into();
-    i64::from_be_bytes(digest[..8].try_into().expect("eight-byte fence key"))
+    let mut fence_key = [0_u8; 8];
+    fence_key.copy_from_slice(&digest[..8]);
+    i64::from_be_bytes(fence_key)
 }
 
 /// Opaque lock-owning primary session issued only inside operation restore.
@@ -193,8 +195,6 @@ pub enum AuthorizationVersionComponentKind {
     InvalidationGeneration = 3,
     /// Protected-object authority epoch.
     AuthorityEpoch = 4,
-    /// Epoch-free client-status revision.
-    ClientStatusRevision = 5,
     /// Verified delegated-relationship revision.
     DelegatedRelationship = 6,
     /// Immutable lifecycle-selector fact generation.
@@ -217,8 +217,6 @@ pub enum AuthorizationProtectedObjectKind {
     ModerationTarget = 5,
     /// Audio session.
     AudioSession = 6,
-    /// Current-binding status observation.
-    BindingStatus = 7,
 }
 
 impl AuthorizationProtectedObjectKind {
@@ -238,7 +236,7 @@ impl AuthorizationProtectedObjectKind {
                 RouteCapability::MediaRead | RouteCapability::MediaWrite
             ),
             Self::ModerationTarget => capability == RouteCapability::Moderation,
-            Self::Domain | Self::Channel | Self::AudioSession | Self::BindingStatus => false,
+            Self::Domain | Self::Channel | Self::AudioSession => false,
         }
     }
 
@@ -251,7 +249,7 @@ impl AuthorizationProtectedObjectKind {
             ),
             Self::Media => capability == RouteCapability::MediaWrite,
             Self::ModerationTarget => capability == RouteCapability::Moderation,
-            Self::Domain | Self::Channel | Self::AudioSession | Self::BindingStatus => false,
+            Self::Domain | Self::Channel | Self::AudioSession => false,
         }
     }
 
@@ -263,7 +261,6 @@ impl AuthorizationProtectedObjectKind {
             4 => Ok(Self::Media),
             5 => Ok(Self::ModerationTarget),
             6 => Ok(Self::AudioSession),
-            7 => Ok(Self::BindingStatus),
             _ => Err(DbError::InvalidData(
                 "authorization protected object kind is invalid".to_owned(),
             )),
@@ -278,7 +275,6 @@ impl AuthorizationVersionComponentKind {
             2 => Ok(Self::Policy),
             3 => Ok(Self::InvalidationGeneration),
             4 => Ok(Self::AuthorityEpoch),
-            5 => Ok(Self::ClientStatusRevision),
             6 => Ok(Self::DelegatedRelationship),
             7 => Ok(Self::LifecycleSelector),
             _ => Err(DbError::InvalidData(
@@ -452,13 +448,13 @@ pub(crate) struct AuthorizationAuthorityObjectEvidence {
 
 impl AuthorizationAuthorityObjectEvidence {
     /// Closed migration-0030 object kind and canonical object key.
-    #[allow(dead_code)] // Consumed by the S3/S4 integration children.
+    #[allow(dead_code)] // Consumed by canonical admission integration.
     pub(crate) const fn coordinate(&self) -> (AuthorizationProtectedObjectKind, [u8; 32]) {
         (self.object_kind, self.object_key)
     }
 
     /// New exact epoch and nonzero observable fence.
-    #[allow(dead_code)] // Consumed by the S3/S4 integration children.
+    #[allow(dead_code)] // Consumed by canonical admission integration.
     pub(crate) const fn epoch_and_fence(&self) -> (u64, AuthorizationLeaseFence) {
         (self.authority_epoch, self.fence)
     }
@@ -471,7 +467,7 @@ impl fmt::Debug for AuthorizationAuthorityObjectEvidence {
 }
 
 /// Opaque exact set of protected-authority advances for one admission loss.
-#[allow(dead_code)] // Consumed by the review-pending S3 lifecycle child.
+#[allow(dead_code)] // Consumed by lifecycle integration.
 pub(crate) struct AuthorizationAuthorityEpochAdvance {
     community_id: CommunityId,
     operation_id: Uuid,
@@ -483,14 +479,14 @@ pub(crate) struct AuthorizationAuthorityEpochAdvance {
 
 impl AuthorizationAuthorityEpochAdvance {
     /// Exact object coordinates re-fenced in canonical order.
-    #[allow(dead_code)] // Consumed by the S3/S4 integration children.
+    #[allow(dead_code)] // Consumed by canonical admission integration.
     pub(crate) fn objects(&self) -> &[AuthorizationAuthorityObjectEvidence] {
         &self.objects
     }
 
     /// Consume the exact database-owned AuthorityEpoch deltas for the complete
     /// operation manifest.
-    #[allow(dead_code)] // Consumed by the S3/S4 integration children.
+    #[allow(dead_code)] // Consumed by canonical admission integration.
     pub(crate) fn matches_operation(
         &self,
         community_id: CommunityId,
@@ -589,17 +585,6 @@ pub fn authorization_version_authority_epoch_component_key(
     )
 }
 
-/// Canonical current-binding status component coordinate.
-pub fn authorization_version_client_status_component_key(
-    community_id: CommunityId,
-    event_author_pubkey: [u8; 32],
-) -> [u8; 32] {
-    authorization_version_component_key(
-        b"client-status",
-        &[community_id.as_uuid().as_bytes(), &event_author_pubkey],
-    )
-}
-
 /// Canonical delegated-relationship component coordinate.
 pub fn authorization_version_delegated_relationship_component_key(
     community_id: CommunityId,
@@ -633,7 +618,7 @@ pub fn authorization_version_lifecycle_selector_component_key(
 /// `protected_object_authority` rows. No matching protected object is an
 /// explicit valid outcome and returns empty evidence/deltas. Existing rows
 /// must advance together with a new nonzero fence; partial state fails closed.
-#[allow(dead_code)] // Consumed by the S3 admission-loss repair child.
+#[allow(dead_code)] // Consumed by admission-loss repair integration.
 pub(crate) async fn advance_admission_loss_authority_tx(
     transaction: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -1092,6 +1077,9 @@ impl Db {
             ));
         }
 
+        let row_limit = i64::try_from(MAX_SUPERSESSION_STEPS + 1).map_err(|_| {
+            DbError::InvalidData("authorization supersession step bound is invalid".to_owned())
+        })?;
         let rows = sqlx::query(
             "SELECT d.operation_id,m.request_fingerprint,m.manifest_digest,\
                     d.before_version,d.after_version,d.component_digest \
@@ -1112,7 +1100,7 @@ impl Db {
         .bind(i64::try_from(floor_version).map_err(|_| {
             DbError::InvalidData("authorization supersession version overflow".to_owned())
         })?)
-        .bind(i64::try_from(MAX_SUPERSESSION_STEPS + 1).expect("bounded step count"))
+        .bind(row_limit)
         .fetch_all(&self.pool)
         .await?;
         if rows.is_empty() || rows.len() > MAX_SUPERSESSION_STEPS {
@@ -1280,26 +1268,6 @@ impl Db {
                     object_key,
                 ),
                 version: from_database_version(row.try_get("authority_epoch")?)?,
-            });
-        }
-
-        let status_rows = sqlx::query(
-            "SELECT event_author_pubkey, MAX(revision) AS revision \
-             FROM client_status_revisions WHERE community_id=$1 \
-             GROUP BY event_author_pubkey ORDER BY event_author_pubkey",
-        )
-        .bind(community_id.as_uuid())
-        .fetch_all(&mut *transaction)
-        .await?;
-        for row in status_rows {
-            let author = bytes32(row.try_get("event_author_pubkey")?, "status author")?;
-            floors.push(AuthorizationVersionComponentFloor {
-                component_kind: AuthorizationVersionComponentKind::ClientStatusRevision,
-                component_key: authorization_version_client_status_component_key(
-                    community_id,
-                    author,
-                ),
-                version: from_database_version(row.try_get("revision")?)?,
             });
         }
 
@@ -1850,8 +1818,8 @@ mod tests {
             new_operation,
             request_fingerprint,
             // The seam itself is operation-kind neutral; use kind 11 here so
-            // this focused test does not need to fabricate S3 lifecycle
-            // history. S3's integration test supplies the kind-9 history row.
+            // This focused test does not need to fabricate lifecycle history.
+            // The lifecycle integration test supplies the kind-9 history row.
             AuthorizationOperationKind::ProtectedMutation,
             actor,
             AuthorizationOperationOutcome::Applied,
