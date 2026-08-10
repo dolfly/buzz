@@ -86,6 +86,13 @@ function metadataCacheKey(href: string): string {
   }
 }
 
+function isNegativeMetadata(metadata: LinkPreviewMetadata | null): boolean {
+  // A cached NEGATIVE is a result that should be retried when the URL freshly
+  // re-enters the composer: a hard miss (null) or a transient image failure.
+  // A healthy hit (`image`/`rejected`/no state) is a settled positive.
+  return metadata === null || metadata.imageFetchState === "transient_failure";
+}
+
 function metadataExpiry(
   metadata: LinkPreviewMetadata | null,
   now: number,
@@ -185,6 +192,19 @@ function createMetadataLoader({
   return {
     deleteKey(key: string) {
       cache.delete(key);
+    },
+    /**
+     * Drop a cached NEGATIVE result (a resolved null or a transient failure) so
+     * the next load refetches. Used when a URL freshly enters the composer: a
+     * user pasting a link that previously blanked should get a new attempt now,
+     * not the stale miss. A healthy cached hit and an in-flight fetch are left
+     * untouched, so passive scroll re-renders still ride the cache as before.
+     */
+    invalidateNegative(href: string) {
+      const key = metadataCacheKey(href);
+      const cached = cache.get(key);
+      if (!cached || cached instanceof Promise) return;
+      if (isNegativeMetadata(cached.metadata)) cache.delete(key);
     },
     load,
     peek,
@@ -417,15 +437,43 @@ export function withEntityFallbacks(
 
 export function useResolvedLinkPreviews(
   previews: SupportedLinkPreview[],
+  {
+    refetchNewNegatives = false,
+  }: {
+    /**
+     * When a preview href is newly present since the last run, drop any cached
+     * NEGATIVE (null/transient-fail) metadata for it so it refetches instead of
+     * resolving to a stale miss. Used by the composer: a freshly pasted link
+     * should get a new attempt. Off by default so passive renders (the message
+     * list) keep riding the cache. Healthy cached hits are never invalidated.
+     */
+    refetchNewNegatives?: boolean;
+  } = {},
 ): ResolvedLinkPreview[] {
   const [resolvedMetadata, setResolvedMetadata] =
     React.useState<ResolvedMetadataByHref>({});
   const [retryGeneration, setRetryGeneration] = React.useState(0);
+  const seenHrefsRef = React.useRef<Set<string>>(new Set());
 
   React.useEffect(() => {
     let cancelled = false;
     let retryAt = Number.POSITIVE_INFINITY;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    if (refetchNewNegatives) {
+      // Invalidate first, before the peek/load loop below reads the cache, so a
+      // newly-present href loads fresh instead of resolving to its stale miss.
+      // buzz:// entity links resolve off the relay, not this cache — skip them.
+      const seen = seenHrefsRef.current;
+      const next = new Set<string>();
+      for (const preview of previews) {
+        next.add(preview.href);
+        if (!seen.has(preview.href) && !preview.href.startsWith("buzz://")) {
+          metadataLoader.invalidateNegative(preview.href);
+        }
+      }
+      seenHrefsRef.current = next;
+    }
 
     const scheduleRetry = (
       { expiresAt, key }: Pick<MetadataLoadResult, "expiresAt" | "key">,
@@ -485,7 +533,7 @@ export function useResolvedLinkPreviews(
       for (const cancel of cancelScheduledLoads) cancel();
       if (retryTimer !== null) clearTimeout(retryTimer);
     };
-  }, [previews, retryGeneration]);
+  }, [previews, refetchNewNegatives, retryGeneration]);
 
   return React.useMemo(
     () =>

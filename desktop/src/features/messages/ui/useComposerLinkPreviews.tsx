@@ -234,8 +234,15 @@ export function useComposerLinkPreviews(content: string, enabled = true) {
   liveCandidatesRef.current = extractCandidates(content).map(
     (preview) => preview.href,
   );
+  // A URL freshly entering the composer (paste, or finishing typing one) should
+  // get a fresh fetch rather than a stale negative cache hit — the user is
+  // actively asking for this link's card now. useResolvedLinkPreviews handles
+  // the timing (invalidate a newly-present href's NEGATIVE cache entry before
+  // it reads the cache); healthy hits and passive message-list scroll are
+  // untouched, so the shared cache still does its job everywhere else.
   const resolvedPreviews = useResolvedLinkPreviews(
     suppressed ? [] : candidates,
+    { refetchNewNegatives: true },
   );
   // Entity links resolve to null metadata when the relay lookup has nothing
   // for them; keep their safe fallback cards rather than dropping them.

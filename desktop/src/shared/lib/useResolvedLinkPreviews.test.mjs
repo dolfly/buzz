@@ -432,3 +432,116 @@ test("Buzz repository metadata stays image-less and exposes default branch", asy
   assert.equal(result?.imageDataUrl, null);
   assert.equal(result?.imageDomain, null);
 });
+
+test("invalidateNegative drops a cached null miss so the next load refetches", async () => {
+  // A URL freshly entering the composer clears a stale hard miss (null) so it
+  // refetches, instead of riding the cached blank.
+  const now = 1_000;
+  let calls = 0;
+  let nextResult = null;
+  const loader = __linkPreviewMetadataTest.createMetadataLoader({
+    fetcher: async () => {
+      calls += 1;
+      return nextResult;
+    },
+    now: () => now,
+  });
+
+  assert.equal((await loader.load(preview.href)).metadata, null);
+  assert.equal(calls, 1);
+
+  loader.invalidateNegative(preview.href);
+  nextResult = metadata();
+  assert.deepEqual((await loader.load(preview.href)).metadata, metadata());
+  assert.equal(calls, 2);
+});
+
+test("invalidateNegative drops a cached transient failure so the next load refetches", async () => {
+  // A transient image failure is a NEGATIVE by contract (option docs + the
+  // loader's own retry boundary), so re-entering the composer must refetch it
+  // — not reuse the cached transient entry. Regression for the leak where
+  // invalidateNegative only cleared hard `null` misses. (PR #5510)
+  const now = 1_000;
+  let calls = 0;
+  const loader = __linkPreviewMetadataTest.createMetadataLoader({
+    fetcher: async () => {
+      calls += 1;
+      return calls === 1
+        ? metadata({
+            imageFetchState: "transient_failure",
+            imageRetryAfterMs: 10_000,
+          })
+        : metadata({
+            imageDataUrl: "data:image/jpeg;base64,abc",
+            imageDomain: "images.example.com",
+            imageFetchState: "image",
+          });
+    },
+    now: () => now,
+  });
+
+  assert.equal(
+    (await loader.load(preview.href)).metadata?.imageFetchState,
+    "transient_failure",
+  );
+  assert.equal(calls, 1);
+
+  // Bust well before the retry boundary (now is frozen); the cache-bust — not
+  // the cooldown — is what forces the refetch.
+  loader.invalidateNegative(preview.href);
+  assert.equal(
+    (await loader.load(preview.href)).metadata?.imageFetchState,
+    "image",
+  );
+  assert.equal(calls, 2);
+});
+
+test("invalidateNegative leaves a healthy cached hit untouched", async () => {
+  // A settled positive (instant card, no redundant fetch) must survive a bust
+  // so passive scroll re-renders keep riding the cache.
+  const now = 1_000;
+  let calls = 0;
+  const loader = __linkPreviewMetadataTest.createMetadataLoader({
+    fetcher: async () => {
+      calls += 1;
+      return metadata();
+    },
+    now: () => now,
+  });
+
+  assert.deepEqual((await loader.load(preview.href)).metadata, metadata());
+  assert.equal(calls, 1);
+
+  loader.invalidateNegative(preview.href);
+  assert.deepEqual((await loader.load(preview.href)).metadata, metadata());
+  assert.equal(calls, 1);
+});
+
+test("invalidateNegative leaves an in-flight fetch untouched", async () => {
+  // A fetch still in flight is cached as a Promise, not a resolved entry.
+  // Busting mid-flight must not cancel or duplicate it: the pending load
+  // resolves normally and no second fetch is started.
+  const now = 1_000;
+  let calls = 0;
+  let releaseFetch;
+  const loader = __linkPreviewMetadataTest.createMetadataLoader({
+    fetcher: () => {
+      calls += 1;
+      return new Promise((resolve) => {
+        releaseFetch = () => resolve(metadata());
+      });
+    },
+    now: () => now,
+  });
+
+  const pending = loader.load(preview.href);
+  assert.equal(calls, 1);
+
+  // Bust while the fetch is still in flight — the Promise entry is left alone.
+  loader.invalidateNegative(preview.href);
+  assert.equal(calls, 1, "no redundant fetch started by the bust");
+
+  releaseFetch();
+  assert.deepEqual((await pending).metadata, metadata());
+  assert.equal(calls, 1, "the original in-flight fetch resolved, not a retry");
+});
