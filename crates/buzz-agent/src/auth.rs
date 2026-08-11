@@ -39,6 +39,202 @@ const TOKEN_REFRESH_LEEWAY: Duration = Duration::from_secs(60);
 /// We match: any longer and the user has gone to lunch.
 const BROWSER_AUTH_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Per-request network timeout for every OAuth HTTP call (discovery, refresh
+/// grant, code exchange). Without this, a hung provider connection would stall
+/// the caller — and, worse, stall every same-key caller waiting on the
+/// cross-process lock this holder owns.
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Longest an in-flight auth attempt can legitimately run: cold discovery
+/// (`30s`) + browser wait (`60s`) + code exchange (`30s`), plus a failed
+/// refresh (`30s`) ahead of the browser. Rounded to `150s`. A waiter derives
+/// its lock-wait bound from this so it never times out ahead of a healthy
+/// holder.
+const AUTH_ATTEMPT_DEADLINE: Duration = Duration::from_secs(150);
+
+/// How long a same-key caller waits to acquire the cross-process lock before
+/// giving up with [`AuthError::LockTimeout`]. Deliberately longer than
+/// [`AUTH_ATTEMPT_DEADLINE`] so a waiter outlasts any legitimate holder rather
+/// than timing out mid-flow.
+const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(165);
+
+/// Poll interval for deadline-aware lock acquisition. `try_lock` is
+/// non-blocking, so we sleep between attempts rather than blocking a worker.
+const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long a failed interactive (browser) attempt suppresses automatic
+/// re-launch for the same key. Long enough that a spurned dropdown does not
+/// re-pop a browser on the next debounced refresh, short enough that a user
+/// who fixes the problem is not locked out.
+const COOLDOWN_DURATION: Duration = Duration::from_secs(300);
+
+/// Why an auth acquisition wants a token, which decides whether it may open a
+/// browser and whether it honors a cooldown.
+///
+/// - [`Auto`](Self::Auto): passive Desktop discovery (create/edit/defaults/
+///   onboarding). May open a browser, but honors an unexpired cooldown and
+///   returns its recorded outcome instead of re-launching.
+/// - [`UserInitiated`](Self::UserInitiated): an explicit human action — the
+///   saved-agent model picker or `buzz-agent auth databricks`. May open a
+///   browser and *bypasses* the cooldown (the user asked for it now).
+/// - [`Headless`](Self::Headless): managed-runtime inference and provider
+///   preflight. Never opens a browser; may consume another attempt's cached
+///   success but never becomes the initiator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthIntent {
+    Auto,
+    UserInitiated,
+    Headless,
+}
+
+impl AuthIntent {
+    /// `true` for the intents permitted to open a browser.
+    fn may_open_browser(self) -> bool {
+        matches!(self, Self::Auto | Self::UserInitiated)
+    }
+
+    /// `true` for the one intent that honors a recorded cooldown on read.
+    fn honors_cooldown(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
+/// Typed result of an auth acquisition. `Ok` carries the bearer; the error
+/// arm classifies *why* no token was produced so callers (and, in Phase 2, the
+/// Tauri boundary) can branch on a stable code instead of matching display
+/// text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthError {
+    /// No cached token, no refresh grant, and the caller may not open a
+    /// browser (`Headless`).
+    NoCredential,
+    /// The user (or provider) rejected the browser authorization.
+    Denied,
+    /// The browser flow was not completed within [`BROWSER_AUTH_TIMEOUT`].
+    TimedOut,
+    /// Every browser-launch strategy failed, so the flow never started.
+    BrowserOpenFailed,
+    /// An OAuth network call (discovery/refresh/exchange) could not reach the
+    /// provider or timed out.
+    NetworkUnavailable,
+    /// A refresh-token grant was rejected (dead/rotated refresh token) and the
+    /// caller may not fall back to a browser.
+    RefreshRejected,
+    /// The authorization-code exchange itself was rejected by the token
+    /// endpoint (distinct from a refresh rejection).
+    ExchangeFailed,
+    /// Could not acquire the cross-process auth lock within
+    /// [`LOCK_WAIT_TIMEOUT`].
+    LockTimeout,
+}
+
+impl AuthError {
+    /// Stable machine-readable code. Phase 2 serializes this across the Tauri
+    /// boundary (the `project_git_merge_error` `{code, message}` precedent) so
+    /// the Desktop formatter switches on the code, never on display text.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NoCredential => "no_credential",
+            Self::Denied => "denied",
+            Self::TimedOut => "timed_out",
+            Self::BrowserOpenFailed => "browser_open_failed",
+            Self::NetworkUnavailable => "network_unavailable",
+            Self::RefreshRejected => "refresh_rejected",
+            Self::ExchangeFailed => "exchange_failed",
+            Self::LockTimeout => "lock_timeout",
+        }
+    }
+
+    /// `true` for the browser-attempt outcomes worth recording in the cooldown
+    /// sidecar — the failures that would otherwise re-pop a browser on the
+    /// next automatic attempt. Non-browser failures (no credential, refresh
+    /// rejection, lock timeout, network) are not recorded.
+    fn is_cooldown_worthy(&self) -> bool {
+        matches!(
+            self,
+            Self::Denied | Self::TimedOut | Self::BrowserOpenFailed | Self::ExchangeFailed
+        )
+    }
+
+    /// Reconstruct a recorded outcome from its [`code`](Self::code). Only the
+    /// cooldown-worthy variants round-trip; any other code (a forward-compat
+    /// sidecar written by a newer buzz-agent) yields `None`, so a stale or
+    /// unrecognized record is treated as "no cooldown" rather than a hard
+    /// failure.
+    fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "denied" => Some(Self::Denied),
+            "timed_out" => Some(Self::TimedOut),
+            "browser_open_failed" => Some(Self::BrowserOpenFailed),
+            "exchange_failed" => Some(Self::ExchangeFailed),
+            _ => None,
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::NoCredential => {
+                "no cached Databricks token; run `buzz-agent auth databricks` first".into()
+            }
+            Self::Denied => "Databricks authorization was denied".into(),
+            Self::TimedOut => "Databricks browser authorization timed out".into(),
+            Self::BrowserOpenFailed => "could not open a browser for Databricks sign-in".into(),
+            Self::NetworkUnavailable => "could not reach Databricks to authenticate".into(),
+            Self::RefreshRejected => "Databricks rejected the refresh token; sign in again".into(),
+            Self::ExchangeFailed => "Databricks rejected the authorization code".into(),
+            Self::LockTimeout => "timed out waiting for a concurrent Databricks sign-in".into(),
+        }
+    }
+}
+
+impl From<AuthError> for AgentError {
+    /// Map a typed auth failure onto the crate error the [`TokenSource`] trait
+    /// returns. Auth-decision failures become [`AgentError::LlmAuth`] so the
+    /// caller's retry loop stops instead of hammering a rejected credential;
+    /// purely infrastructural failures (network, lock contention) become
+    /// [`AgentError::Llm`], matching the pre-coordinator classification of a
+    /// discovery/network error.
+    fn from(e: AuthError) -> Self {
+        match e {
+            AuthError::NetworkUnavailable | AuthError::LockTimeout => AgentError::Llm(e.message()),
+            AuthError::NoCredential
+            | AuthError::Denied
+            | AuthError::TimedOut
+            | AuthError::BrowserOpenFailed
+            | AuthError::RefreshRejected
+            | AuthError::ExchangeFailed => AgentError::LlmAuth(e.message()),
+        }
+    }
+}
+
+/// Opens a URL for the interactive browser step. Injected so the PKCE
+/// continuation (callback listener, verifier, timeout) stays alive across the
+/// launch: the coordinator calls this *while* the localhost listener is
+/// bound, so a launch failure never leaves a returned URL pointing at a torn
+/// down listener. Desktop (Phase 2) supplies the Tauri opener; the CLI uses
+/// [`DefaultBrowserOpener`], which prints the URL and opens the system
+/// browser.
+pub trait BrowserOpener: Send + Sync {
+    /// Attempt to present `url` to the user. Returning `Err` means every
+    /// launch strategy for this opener failed; the coordinator then reports
+    /// [`AuthError::BrowserOpenFailed`] without waiting on a listener nobody
+    /// will reach.
+    fn open(&self, url: &str) -> Result<(), String>;
+}
+
+/// Default opener: print the URL (so a user on a headless box can copy it)
+/// and open the system browser. Printing is itself a launch strategy, so this
+/// never reports failure — the URL is always visible to the waiting user.
+pub struct DefaultBrowserOpener;
+
+impl BrowserOpener for DefaultBrowserOpener {
+    fn open(&self, url: &str) -> Result<(), String> {
+        eprintln!("Opening browser for authentication. If it doesn't open, visit:\n  {url}");
+        let _ = webbrowser::open(url);
+        Ok(())
+    }
+}
+
 /// Asynchronous source of a bearer token. The [`Llm`] calls this per
 /// request, so impls are expected to be cheap on the cache-hit path.
 #[async_trait]
@@ -136,25 +332,64 @@ pub struct PkceOAuthTokenSource {
     cfg: PkceOAuthConfig,
     http: Client,
     cache_path: PathBuf,
-    /// Single-flight guard: only one refresh/browser flow at a time, even
-    /// if many tool calls land concurrently.
+    /// Injected browser launcher, called inside [`browser_pkce_flow`] while the
+    /// localhost listener is live. Production uses [`DefaultBrowserOpener`];
+    /// Phase 2 supplies the Tauri opener.
+    opener: Arc<dyn BrowserOpener>,
+    /// In-memory single-flight *and* fast-path cache. The cross-process file
+    /// lock serializes slow-path work; this cell keeps the fast path off disk
+    /// during a turn and off the lock entirely.
     state: Mutex<Option<CachedToken>>,
 }
 
 impl PkceOAuthTokenSource {
+    /// Construct with the default browser opener (prints the URL and opens the
+    /// system browser). This is the signature every production call site uses.
     pub fn new(cfg: PkceOAuthConfig) -> Result<Arc<Self>, AgentError> {
+        Self::new_with(cfg, Arc::new(DefaultBrowserOpener))
+    }
+
+    /// Construct with an injected [`BrowserOpener`]. Tests substitute a
+    /// recording/failing opener to exercise the browser branch without a real
+    /// window; Phase 2 Desktop injects the Tauri opener.
+    pub fn new_with(
+        cfg: PkceOAuthConfig,
+        opener: Arc<dyn BrowserOpener>,
+    ) -> Result<Arc<Self>, AgentError> {
         let cache_path = cache_path_for(&cfg)?;
         if let Some(parent) = cache_path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| AgentError::Llm(format!("oauth cache dir {parent:?}: {e}")))?;
         }
+        // Every OAuth HTTP call inherits this timeout so a hung provider can
+        // never stall the caller — nor the same-key callers waiting on the
+        // cross-process lock this holder owns. A build failure falls back to
+        // the untimed default rather than making construction fallible.
+        let http = Client::builder()
+            .timeout(HTTP_REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| Client::new());
         let initial = read_cache(&cache_path);
         Ok(Arc::new(Self {
             cfg,
-            http: Client::new(),
+            http,
             cache_path,
+            opener,
             state: Mutex::new(initial),
         }))
+    }
+
+    /// Path of the cross-process advisory lock file guarding slow-path auth
+    /// for this cache key. Co-located with the cache so it shares the
+    /// per-key directory and `$HOME` override.
+    fn lock_path(&self) -> PathBuf {
+        append_ext(&self.cache_path, "lock")
+    }
+
+    /// Path of the cooldown sidecar recording the last browser-attempt
+    /// failure for this cache key.
+    fn cooldown_path(&self) -> PathBuf {
+        append_ext(&self.cache_path, "cooldown")
     }
 
     /// Discover authorization + token endpoints from the well-known URL.
@@ -232,192 +467,244 @@ impl PkceOAuthTokenSource {
         token_from_response(&v, Some(refresh_token))
     }
 
-    /// Run the full browser-mediated Authorization Code + PKCE flow.
-    /// Caller must hold a TTY/browser: this opens a window and blocks.
+    /// Run the full browser-mediated Authorization Code + PKCE flow and cache
+    /// the result. Routes through the coordinator as a [`UserInitiated`]
+    /// acquisition: it may open a browser, bypasses (and clears) any cooldown,
+    /// and single-flights with concurrent callers on the cross-process lock. A
+    /// still-valid cached token short-circuits to success without re-prompting.
+    ///
+    /// [`UserInitiated`]: AuthIntent::UserInitiated
     pub async fn interactive_login(&self) -> Result<(), AgentError> {
-        let endpoints = self.endpoints().await?;
-        let token = browser_pkce_flow(&self.http, &self.cfg, &endpoints).await?;
-        let mut state = self.state.lock().await;
-        self.save(&mut state, token)?;
+        self.acquire(AuthIntent::UserInitiated, None).await?;
         Ok(())
+    }
+
+    /// Public entry for passive Desktop discovery (Phase 2): acquire a bearer
+    /// under an explicit [`AuthIntent`], returning the typed [`AuthError`] so
+    /// the caller can branch on a stable `code` rather than display text. The
+    /// [`TokenSource`] trait methods wrap this and flatten the error into
+    /// [`AgentError`].
+    pub async fn acquire_with_intent(&self, intent: AuthIntent) -> Result<String, AuthError> {
+        self.acquire(intent, None).await
+    }
+
+    /// Return a usable cached bearer, applying the identity rule for a
+    /// 401-driven acquisition.
+    ///
+    /// `rejected = None` (normal): a not-yet-expired cached token is a hit.
+    /// `rejected = Some(t)`: the expiry clock is untrustworthy — the rejected
+    /// token looked locally fresh — so a hit requires the cached token to
+    /// *differ* from `t`, meaning a sibling already replaced it. Checks the
+    /// in-memory cell first, then re-reads disk (a sibling process may have
+    /// written a newer token) and adopts it into the cell on a hit.
+    fn cached_hit(
+        &self,
+        state: &mut Option<CachedToken>,
+        rejected: Option<&str>,
+    ) -> Option<String> {
+        let usable = |tok: &CachedToken| match rejected {
+            Some(r) => tok.access_token != r,
+            None => !is_expired(tok),
+        };
+        if let Some(tok) = state.as_ref() {
+            if usable(tok) {
+                return Some(tok.access_token.clone());
+            }
+        }
+        if let Some(disk) = read_cache(&self.cache_path) {
+            if usable(&disk) {
+                let bearer = disk.access_token.clone();
+                *state = Some(disk);
+                return Some(bearer);
+            }
+        }
+        None
+    }
+
+    /// Discover OIDC endpoints once per flow, memoizing into `slot` so the
+    /// refresh and browser branches share a single discovery call. A discovery
+    /// failure (unreachable URL or malformed document) maps to
+    /// [`AuthError::NetworkUnavailable`] — the infrastructural bucket, so the
+    /// caller's retry loop treats it as transient rather than as an auth
+    /// decision.
+    async fn discover<'a>(
+        &self,
+        slot: &'a mut Option<OidcEndpoints>,
+    ) -> Result<&'a OidcEndpoints, AuthError> {
+        if slot.is_none() {
+            let eps = self
+                .endpoints()
+                .await
+                .map_err(|_| AuthError::NetworkUnavailable)?;
+            *slot = Some(eps);
+        }
+        Ok(slot.as_ref().expect("endpoints just populated"))
+    }
+
+    /// The single acquisition entry point behind every [`TokenSource`] method.
+    ///
+    /// `intent` decides browser and cooldown policy; `rejected` (`Some` only on
+    /// a 401-driven refresh) switches cache checks from clock-based to
+    /// identity-based. The fast path returns a usable cached token without
+    /// touching the lock or the network. Otherwise the slow path serializes
+    /// every same-key caller — in this process *and* across processes — on the
+    /// cross-process advisory lock, so concurrent dialogs coalesce onto one
+    /// refresh/browser flow instead of racing browsers.
+    async fn acquire(
+        &self,
+        intent: AuthIntent,
+        rejected: Option<&str>,
+    ) -> Result<String, AuthError> {
+        // Fast path: no lock, no network.
+        {
+            let mut state = self.state.lock().await;
+            if let Some(hit) = self.cached_hit(&mut state, rejected) {
+                return Ok(hit);
+            }
+        }
+
+        // Slow path: one flow at a time per cache key. The waiter's deadline
+        // exceeds a healthy holder's attempt deadline, so it never gives up on
+        // a live holder.
+        let deadline = std::time::Instant::now() + LOCK_WAIT_TIMEOUT;
+        let _guard = acquire_auth_lock(&self.lock_path(), deadline).await?;
+
+        // Bound the whole locked attempt so a wedged flow can't hold the lock
+        // past the waiters' patience. On expiry the lock releases (guard drop)
+        // and the attempt reports TimedOut.
+        match tokio::time::timeout(AUTH_ATTEMPT_DEADLINE, self.acquire_locked(intent, rejected))
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(AuthError::TimedOut),
+        }
+    }
+
+    /// Slow-path body, run while holding the cross-process auth lock.
+    async fn acquire_locked(
+        &self,
+        intent: AuthIntent,
+        rejected: Option<&str>,
+    ) -> Result<String, AuthError> {
+        let mut state = self.state.lock().await;
+
+        // Re-check under the lock: a holder we queued behind may have already
+        // produced a token (this process or a sibling wrote the cache).
+        if let Some(hit) = self.cached_hit(&mut state, rejected) {
+            return Ok(hit);
+        }
+
+        // Refresh-token grant, if we have one. Endpoints are discovered lazily
+        // here (and reused by the browser branch) so a no-refresh headless
+        // failure never depends on reaching the discovery URL.
+        let mut endpoints: Option<OidcEndpoints> = None;
+        let mut refresh_failed = false;
+        if let Some(rt) = state.as_ref().and_then(|t| t.refresh_token.clone()) {
+            let eps = self.discover(&mut endpoints).await?;
+            match self.refresh(eps, &rt).await {
+                Ok(fresh) => return self.finish(&mut state, fresh),
+                Err(e) => {
+                    tracing::warn!(error = %e, "oauth refresh failed; falling back");
+                    // A sibling may still have won the race while we ran.
+                    if let Some(hit) = self.cached_hit(&mut state, rejected) {
+                        return Ok(hit);
+                    }
+                    refresh_failed = true;
+                }
+            }
+        }
+
+        // No token from cache or refresh. Browser or terminal failure.
+        if !intent.may_open_browser() {
+            return Err(if refresh_failed {
+                AuthError::RefreshRejected
+            } else {
+                AuthError::NoCredential
+            });
+        }
+
+        let cooldown_path = self.cooldown_path();
+        if intent.honors_cooldown() {
+            // A recent browser attempt failed; surface its recorded outcome
+            // instead of re-popping a browser on this automatic attempt.
+            if let Some(recorded) = read_cooldown(&cooldown_path) {
+                return Err(recorded);
+            }
+        } else {
+            // An explicit user retry clears any prior suppression.
+            clear_cooldown(&cooldown_path);
+        }
+
+        let eps = self.discover(&mut endpoints).await?;
+        match browser_pkce_flow(&self.http, &self.cfg, eps, self.opener.as_ref()).await {
+            // `finish` clears the cooldown on success.
+            Ok(fresh) => self.finish(&mut state, fresh),
+            Err(e) => {
+                if e.is_cooldown_worthy() {
+                    write_cooldown(&cooldown_path, &e);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Persist a freshly-obtained token, clear any cooldown, and return its
+    /// bearer. A cache-write failure maps to [`AuthError::NetworkUnavailable`]
+    /// (the infrastructural bucket) — the token was valid but couldn't be
+    /// persisted, which the caller should treat as transient, not as a
+    /// credential rejection.
+    fn finish(
+        &self,
+        state: &mut Option<CachedToken>,
+        token: CachedToken,
+    ) -> Result<String, AuthError> {
+        let bearer = token.access_token.clone();
+        self.save(state, token)
+            .map_err(|_| AuthError::NetworkUnavailable)?;
+        clear_cooldown(&self.cooldown_path());
+        Ok(bearer)
     }
 }
 
 #[async_trait]
 impl TokenSource for PkceOAuthTokenSource {
+    /// Acquire a bearer for a request. Routes through the coordinator as a
+    /// [`Headless`](AuthIntent::Headless) acquisition: it serves a cached or
+    /// refreshed token but never opens a browser, so a managed runtime with no
+    /// interactive display can never hang on inference. First-use auth is the
+    /// job of `buzz-agent auth databricks` ([`interactive_login`]).
+    ///
+    /// [`interactive_login`]: PkceOAuthTokenSource::interactive_login
     async fn bearer(&self) -> Result<String, AgentError> {
-        let mut state = self.state.lock().await;
-
-        // 1. In-memory cache hit, still fresh.
-        if let Some(tok) = state.as_ref() {
-            if !is_expired(tok) {
-                return Ok(tok.access_token.clone());
-            }
-        }
-
-        // 2. Re-read disk — another process may have refreshed already.
-        if let Some(disk_tok) = read_cache(&self.cache_path) {
-            if !is_expired(&disk_tok) {
-                let bearer = disk_tok.access_token.clone();
-                *state = Some(disk_tok);
-                return Ok(bearer);
-            }
-        }
-
-        // 3. Try refresh if we have a refresh token. Discover endpoints once
-        //    here — deliberately hoisted above the refresh-token check so the
-        //    browser flow at step 5 (which also needs them) reuses this call.
-        let endpoints = self.endpoints().await?;
-        let refresh = state.as_ref().and_then(|t| t.refresh_token.clone());
-        if let Some(rt) = refresh {
-            match self.refresh(&endpoints, &rt).await {
-                Ok(fresh) => {
-                    let bearer = fresh.access_token.clone();
-                    self.save(&mut state, fresh)?;
-                    return Ok(bearer);
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "oauth refresh failed; falling back to browser flow");
-                }
-            }
-
-            // 4. Re-read disk after refresh failure — another process may have won the race.
-            if let Some(disk_tok) = read_cache(&self.cache_path) {
-                if !is_expired(&disk_tok) {
-                    let bearer = disk_tok.access_token.clone();
-                    *state = Some(disk_tok);
-                    return Ok(bearer);
-                }
-            }
-        }
-
-        // 5. No usable cache: full browser dance.
-        let fresh = browser_pkce_flow(&self.http, &self.cfg, &endpoints).await?;
-        let bearer = fresh.access_token.clone();
-        self.save(&mut state, fresh)?;
-        Ok(bearer)
+        self.acquire(AuthIntent::Headless, None)
+            .await
+            .map_err(Into::into)
     }
 
+    /// Identical to [`bearer`](Self::bearer) for this source — both are
+    /// headless. Retained as a distinct method so callers can state the
+    /// no-browser requirement at the call site (and so other [`TokenSource`]
+    /// impls that *would* browse in `bearer` can still expose a safe path).
     async fn bearer_no_browser(&self) -> Result<String, AgentError> {
-        self.try_bearer_no_browser().await
+        self.acquire(AuthIntent::Headless, None)
+            .await
+            .map_err(Into::into)
     }
 
-    /// Force-refresh after a 401, never touching the browser flow.
+    /// Force a fresh bearer after the server rejected `rejected` with a 401.
     ///
-    /// `rejected` is the access token the server just 401'd. Coalescing keys
-    /// off token *identity*, not the expiry clock: a 401 means the token was
-    /// rejected while it still looked locally fresh, so `is_expired()` would
-    /// say "keep it" and no grant would ever run. Instead, under the lock we
-    /// compare the current cached token to `rejected` — if they differ, a
-    /// concurrent caller (this process or a sibling) already refreshed, so we
-    /// return the new token without burning a second grant. If they still
-    /// match, this is the rejected token and we run the refresh-token grant
-    /// unconditionally. The whole check→refresh→save runs under one lock hold
-    /// so concurrent callers serialize. On any failure the refresh token is
-    /// preserved (never nulled) and the error is terminal `LlmAuth` — no
-    /// browser, no hang.
+    /// A [`Headless`](AuthIntent::Headless) acquisition keyed by token
+    /// *identity* rather than the expiry clock: a 401 means the cached token
+    /// was rejected while still locally fresh, so [`is_expired`] would wrongly
+    /// keep it. Passing `rejected` makes the coordinator run the refresh-token
+    /// grant unless a concurrent caller already replaced the token, in which
+    /// case that newer token is returned without a second grant. Never opens a
+    /// browser; a dead refresh token surfaces terminally so the retry loop
+    /// stops instead of hanging.
     async fn refresh_now(&self, rejected: &str) -> Result<String, AgentError> {
-        let mut state = self.state.lock().await;
-
-        // 1. Coalesce by identity: if the cached token (in-memory, then disk)
-        //    is no longer the one the server rejected, someone already
-        //    refreshed it. Return that instead of grabbing another grant.
-        if let Some(tok) = state.as_ref() {
-            if tok.access_token != rejected {
-                return Ok(tok.access_token.clone());
-            }
-        }
-        if let Some(disk_tok) = read_cache(&self.cache_path) {
-            if disk_tok.access_token != rejected {
-                let bearer = disk_tok.access_token.clone();
-                *state = Some(disk_tok);
-                return Ok(bearer);
-            }
-        }
-
-        // 2. The cached token is still the rejected one. Run the refresh-token
-        //    grant unconditionally — the expiry clock can't be trusted here, a
-        //    locally-fresh token is exactly what got 401'd.
-        let refresh = state.as_ref().and_then(|t| t.refresh_token.clone());
-        let Some(rt) = refresh else {
-            return Err(AgentError::LlmAuth(
-                "token rejected and no refresh token available".into(),
-            ));
-        };
-        let endpoints = self.endpoints().await?;
-        match self.refresh(&endpoints, &rt).await {
-            Ok(fresh) => {
-                let bearer = fresh.access_token.clone();
-                self.save(&mut state, fresh)?;
-                Ok(bearer)
-            }
-            // 3. Refresh token is itself dead. Terminal — surfacing LlmAuth
-            //    stops the retry loop instead of falling to the browser flow,
-            //    which would hang a headless harness.
-            Err(e) => Err(AgentError::LlmAuth(format!("token refresh failed: {e}"))),
-        }
-    }
-}
-
-impl PkceOAuthTokenSource {
-    /// Return a bearer token from cache or refresh, **never** opening a browser.
-    ///
-    /// Follows the same steps as [`bearer`](TokenSource::bearer) but stops at
-    /// step 4 — if no usable token is available after cache + refresh attempts,
-    /// returns `Err(LlmAuth(...))` instead of launching the browser PKCE flow.
-    /// Used by model-discovery paths that must not block on user interaction.
-    pub(crate) async fn try_bearer_no_browser(&self) -> Result<String, AgentError> {
-        let mut state = self.state.lock().await;
-
-        // 1. In-memory cache hit, still fresh.
-        if let Some(tok) = state.as_ref() {
-            if !is_expired(tok) {
-                return Ok(tok.access_token.clone());
-            }
-        }
-
-        // 2. Re-read disk — another process may have refreshed already.
-        if let Some(disk_tok) = read_cache(&self.cache_path) {
-            if !is_expired(&disk_tok) {
-                let bearer = disk_tok.access_token.clone();
-                *state = Some(disk_tok);
-                return Ok(bearer);
-            }
-        }
-
-        // 3. Try refresh if we have a refresh token.  Endpoints are discovered
-        //    lazily here — only when a refresh token is actually present — so
-        //    that an unreachable OIDC discovery URL cannot prevent the
-        //    no-token/no-cache path from returning `LlmAuth` (graceful
-        //    fallback) instead of `Llm` (hard error).
-        let refresh = state.as_ref().and_then(|t| t.refresh_token.clone());
-        if let Some(rt) = refresh {
-            let endpoints = self.endpoints().await?;
-            match self.refresh(&endpoints, &rt).await {
-                Ok(fresh) => {
-                    let bearer = fresh.access_token.clone();
-                    self.save(&mut state, fresh)?;
-                    return Ok(bearer);
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "oauth refresh failed during model discovery");
-                }
-            }
-
-            // 4. Re-read disk after refresh failure.
-            if let Some(disk_tok) = read_cache(&self.cache_path) {
-                if !is_expired(&disk_tok) {
-                    let bearer = disk_tok.access_token.clone();
-                    *state = Some(disk_tok);
-                    return Ok(bearer);
-                }
-            }
-        }
-
-        // No usable token — return error instead of opening a browser.
-        Err(AgentError::LlmAuth(
-            "no cached Databricks token; run `buzz-agent auth databricks` first".into(),
-        ))
+        self.acquire(AuthIntent::Headless, Some(rejected))
+            .await
+            .map_err(Into::into)
     }
 }
 
@@ -437,11 +724,7 @@ fn is_expired(t: &CachedToken) -> bool {
     let Some(exp) = t.expires_at else {
         return false;
     };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    now + TOKEN_REFRESH_LEEWAY.as_secs() >= exp
+    now_secs() + TOKEN_REFRESH_LEEWAY.as_secs() >= exp
 }
 
 fn cache_path_for(cfg: &PkceOAuthConfig) -> Result<PathBuf, AgentError> {
@@ -463,6 +746,123 @@ fn cache_path_for(cfg: &PkceOAuthConfig) -> Result<PathBuf, AgentError> {
             .join(&cfg.cache_namespace),
     };
     Ok(dir.join(format!("{hash}.json")))
+}
+
+/// Append `ext` as an extra extension onto `base` (e.g. `<hash>.json` →
+/// `<hash>.json.lock`). Keeps the lock and cooldown sidecars in the same
+/// per-key directory as the cache, so they inherit its `$HOME` override and
+/// owner-only parent without a second key derivation.
+fn append_ext(base: &Path, ext: &str) -> PathBuf {
+    let mut name = base.as_os_str().to_owned();
+    name.push(".");
+    name.push(ext);
+    PathBuf::from(name)
+}
+
+/// Durable record of the last browser-attempt failure for a cache key. Written
+/// while holding the auth lock so concurrent writers can't interleave, read by
+/// `Auto` callers to decide whether to suppress an automatic browser re-launch.
+#[derive(Debug, Serialize, Deserialize)]
+struct CooldownRecord {
+    /// [`AuthError::code`] of the failure being cooled down.
+    code: String,
+    /// Unix seconds after which the cooldown lapses and an `Auto` caller may
+    /// launch a browser again.
+    until: u64,
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Return the still-active cooldown outcome for `path`, if any.
+///
+/// `None` when the sidecar is absent, unparseable, expired, or records a code
+/// this build doesn't recognize — every one of those means "no active
+/// cooldown", so the caller proceeds to a normal attempt. An expired record is
+/// removed opportunistically so the directory doesn't accumulate stale files.
+fn read_cooldown(path: &Path) -> Option<AuthError> {
+    let body = fs::read(path).ok()?;
+    let record: CooldownRecord = serde_json::from_slice(&body).ok()?;
+    if record.until > now_secs() {
+        AuthError::from_code(&record.code)
+    } else {
+        let _ = fs::remove_file(path);
+        None
+    }
+}
+
+/// Record `err` as a fresh cooldown at `path`, expiring [`COOLDOWN_DURATION`]
+/// from now. Best-effort: a write failure only means the next automatic
+/// attempt may re-pop a browser, never a hard auth failure, so errors are
+/// swallowed. Called while holding the auth lock.
+fn write_cooldown(path: &Path, err: &AuthError) {
+    let record = CooldownRecord {
+        code: err.code().to_string(),
+        until: now_secs() + COOLDOWN_DURATION.as_secs(),
+    };
+    if let Ok(body) = serde_json::to_vec(&record) {
+        let _ = write_private_cache(path, &body);
+    }
+}
+
+/// Remove any cooldown sidecar at `path`. Called on a successful acquisition
+/// (the problem is resolved) and by `UserInitiated` callers that bypass the
+/// cooldown (an explicit retry clears the suppression). Best-effort.
+fn clear_cooldown(path: &Path) {
+    let _ = fs::remove_file(path);
+}
+
+/// Hold on the cross-process auth lock. Dropping it (or the owning process
+/// dying) releases the OS advisory lock — no PID files, no manual break.
+#[derive(Debug)]
+struct AuthLockGuard(fs::File);
+
+impl Drop for AuthLockGuard {
+    fn drop(&mut self) {
+        // Explicit for intent; closing the fd would release it regardless.
+        let _ = self.0.unlock();
+    }
+}
+
+/// Acquire the cross-process auth lock at `path`, polling until `deadline`.
+///
+/// `File::try_lock` is per–open-file-description, so a lock taken on one
+/// handle blocks every other handle — same process or not — which is exactly
+/// the single-flight guarantee we want without a separate in-memory registry.
+/// The lock is non-blocking, so we poll on [`LOCK_POLL_INTERVAL`] rather than
+/// parking a worker thread in a blocking `lock()`. A waiter whose `deadline`
+/// lapses returns [`AuthError::LockTimeout`]; because the caller sets that
+/// deadline longer than [`AUTH_ATTEMPT_DEADLINE`], a healthy holder always
+/// finishes first.
+async fn acquire_auth_lock(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<AuthLockGuard, AuthError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|_| AuthError::LockTimeout)?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .map_err(|_| AuthError::LockTimeout)?;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(AuthLockGuard(file)),
+            Err(fs::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(AuthError::LockTimeout);
+                }
+                tokio::time::sleep(LOCK_POLL_INTERVAL).await;
+            }
+            Err(fs::TryLockError::Error(_)) => return Err(AuthError::LockTimeout),
+        }
+    }
 }
 
 /// Load a cached token, enforcing the owner-only invariant on load.
@@ -712,21 +1112,37 @@ fn sanitize_callback_detail(raw: &str) -> String {
         .collect()
 }
 
-/// Spin up a localhost callback server, open the authorize URL in a
-/// browser, wait up to [`BROWSER_AUTH_TIMEOUT`] for the redirect, then
-/// exchange the code for a token.
+/// Spin up a localhost callback server, hand the authorize URL to `opener`,
+/// wait up to [`BROWSER_AUTH_TIMEOUT`] for the redirect, then exchange the
+/// code for a token.
+///
+/// `opener` is invoked *after* the listener is bound and the abort guard is
+/// armed, so a launch failure never returns a URL pointing at a torn-down
+/// listener. Every failure is a typed [`AuthError`] so the coordinator can
+/// record a cooldown (or not) by category: an open failure is
+/// [`BrowserOpenFailed`], a redirect that never arrives is [`TimedOut`], a
+/// provider-reported denial is [`Denied`], and a rejected code exchange is
+/// [`ExchangeFailed`]; infrastructure faults (bind/exchange transport) are
+/// [`NetworkUnavailable`].
+///
+/// [`BrowserOpenFailed`]: AuthError::BrowserOpenFailed
+/// [`TimedOut`]: AuthError::TimedOut
+/// [`Denied`]: AuthError::Denied
+/// [`ExchangeFailed`]: AuthError::ExchangeFailed
+/// [`NetworkUnavailable`]: AuthError::NetworkUnavailable
 async fn browser_pkce_flow(
     http: &Client,
     cfg: &PkceOAuthConfig,
     endpoints: &OidcEndpoints,
-) -> Result<CachedToken, AgentError> {
+    opener: &dyn BrowserOpener,
+) -> Result<CachedToken, AuthError> {
     use axum::{extract::Query, response::Html, routing::get, Router};
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use tokio::sync::oneshot;
 
-    let (verifier, challenge) = pkce_pair()?;
-    let state = random_state()?;
+    let (verifier, challenge) = pkce_pair().map_err(|_| AuthError::NetworkUnavailable)?;
+    let state = random_state().map_err(|_| AuthError::NetworkUnavailable)?;
 
     let (tx, rx) = oneshot::channel::<Result<String, String>>();
     let tx = Arc::new(Mutex::new(Some(tx)));
@@ -749,10 +1165,10 @@ async fn browser_pkce_flow(
 
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
-        .map_err(|e| AgentError::Llm(format!("oauth callback bind: {e}")))?;
+        .map_err(|_| AuthError::NetworkUnavailable)?;
     let port = listener
         .local_addr()
-        .map_err(|e| AgentError::Llm(format!("oauth callback addr: {e}")))?
+        .map_err(|_| AuthError::NetworkUnavailable)?
         .port();
     let redirect_uri = format!("http://localhost:{port}");
 
@@ -774,14 +1190,25 @@ async fn browser_pkce_flow(
         urlencoding::encode(&challenge),
     );
 
-    eprintln!("Opening browser for authentication. If it doesn't open, visit:\n  {auth_url}");
-    let _ = webbrowser::open(&auth_url);
+    // Launch the browser while the listener is live. A launch failure aborts
+    // before we wait on a redirect nobody can send.
+    opener.open(&auth_url).map_err(|e| {
+        tracing::warn!(error = %e, "oauth browser launch failed");
+        AuthError::BrowserOpenFailed
+    })?;
 
-    let code = tokio::time::timeout(BROWSER_AUTH_TIMEOUT, rx)
-        .await
-        .map_err(|_| AgentError::Llm("oauth: browser auth timed out".into()))?
-        .map_err(|_| AgentError::Llm("oauth: callback sender dropped".into()))?
-        .map_err(|e| AgentError::Llm(format!("oauth callback: {e}")))?;
+    let code = match tokio::time::timeout(BROWSER_AUTH_TIMEOUT, rx).await {
+        // Timed out waiting for the redirect.
+        Err(_) => return Err(AuthError::TimedOut),
+        // Callback task dropped the sender without sending — treat as timeout.
+        Ok(Err(_)) => return Err(AuthError::TimedOut),
+        // Provider/user reported an error (denial, state mismatch, missing code).
+        Ok(Ok(Err(detail))) => {
+            tracing::warn!(detail = %detail, "oauth callback reported failure");
+            return Err(AuthError::Denied);
+        }
+        Ok(Ok(Ok(code))) => code,
+    };
 
     // Exchange code for token.
     let params = [
@@ -796,21 +1223,20 @@ async fn browser_pkce_flow(
         .form(&params)
         .send()
         .await
-        .map_err(|e| AgentError::Llm(format!("oauth exchange: {e}")))?;
+        .map_err(|_| AuthError::NetworkUnavailable)?;
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(AgentError::Llm(format!("oauth exchange failed: {body}")));
+        tracing::warn!(status = "error", body = %body, "oauth code exchange rejected");
+        return Err(AuthError::ExchangeFailed);
     }
-    let v: Value = resp
-        .json()
-        .await
-        .map_err(|e| AgentError::Llm(format!("oauth exchange json: {e}")))?;
-    token_from_response(&v, None)
+    let v: Value = resp.json().await.map_err(|_| AuthError::ExchangeFailed)?;
+    token_from_response(&v, None).map_err(|_| AuthError::ExchangeFailed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn pkce_pair_produces_valid_challenge() {
@@ -944,10 +1370,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_bearer_falls_through_to_browser_when_disk_also_expired() {
+    async fn test_bearer_headless_no_credential_is_terminal_without_browser() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = PkceOAuthConfig {
-            discovery_url: "https://example.com/.well-known".into(),
+            // Unreachable discovery URL: if bearer() ever attempts discovery or
+            // a browser flow, this test would hang or error differently. The
+            // headless path must not touch either.
+            discovery_url: "https://invalid.example.test/.well-known".into(),
             client_id: "test-client".into(),
             scopes: vec!["offline_access".into()],
             cache_namespace: "test".into(),
@@ -955,7 +1384,7 @@ mod tests {
         };
         let source = PkceOAuthTokenSource::new(cfg).unwrap();
 
-        // Expire the in-memory state.
+        // Expire the in-memory state with no refresh token.
         {
             let mut state = source.state.lock().await;
             *state = Some(CachedToken {
@@ -965,7 +1394,7 @@ mod tests {
             });
         }
 
-        // Write an expired token to disk too.
+        // Write an expired, refresh-less token to disk too.
         let expired_token = CachedToken {
             access_token: "also-stale".into(),
             refresh_token: None,
@@ -974,27 +1403,25 @@ mod tests {
         let body = serde_json::to_vec_pretty(&expired_token).unwrap();
         fs::write(&source.cache_path, &body).unwrap();
 
-        // bearer() should fall through past the disk check.
-        // It will fail at the endpoints() discovery call since there's no server,
-        // which proves it didn't short-circuit on the expired disk token.
-        let result = source.bearer().await;
-        assert!(result.is_err());
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("oauth discovery"),
-            "expected discovery error, got: {err_msg}"
-        );
+        // bearer() is a Headless acquisition: past the cache checks with no
+        // refresh token, it returns terminally instead of opening a browser.
+        // With no refresh token it never even discovers endpoints, so the
+        // unreachable URL is never contacted — the error is a graceful
+        // LlmAuth, not a hard Llm/discovery error.
+        match source.bearer().await.unwrap_err() {
+            AgentError::LlmAuth(_) => {} // correct: terminal, no browser
+            other => panic!("expected terminal LlmAuth, got: {other:?}"),
+        }
     }
 
-    /// `try_bearer_no_browser` with an empty cache and no refresh token must
+    /// `bearer_no_browser` with an empty cache and no refresh token must
     /// return `LlmAuth` immediately — it must NOT attempt OIDC discovery even
-    /// when the `discovery_url` is unreachable/invalid.  This guards the
-    /// regression where `endpoints()` was called unconditionally before the
-    /// refresh-token check, causing an `Llm` error (hard failure) instead of
-    /// the intended graceful `LlmAuth` fallback.
+    /// when the `discovery_url` is unreachable/invalid, and must never browse.
+    /// This guards the regression where `endpoints()` was called
+    /// unconditionally before the refresh-token check, causing an `Llm` error
+    /// (hard failure) instead of the intended graceful `LlmAuth` fallback.
     #[tokio::test]
-    async fn test_try_bearer_no_browser_empty_cache_no_refresh_returns_llm_auth_without_discovery()
-    {
+    async fn test_bearer_no_browser_empty_cache_no_refresh_returns_llm_auth_without_discovery() {
         let dir = tempfile::tempdir().unwrap();
         // Intentionally invalid/unreachable discovery URL — if endpoints() is
         // called, the test will get an `Llm` error and the assertion below fails.
@@ -1016,7 +1443,7 @@ mod tests {
 
         // No disk cache file either — dir is empty.
 
-        let result = source.try_bearer_no_browser().await;
+        let result = source.bearer_no_browser().await;
         assert!(result.is_err(), "expected Err, got Ok");
         match result.unwrap_err() {
             AgentError::LlmAuth(_) => {} // correct: graceful fallback
@@ -1340,6 +1767,71 @@ mod tests {
         assert!(
             read_cache(&link).is_none(),
             "read_cache followed a symlinked cache path"
+        );
+    }
+
+    // ---- cross-process advisory lock primitive --------------------------
+    //
+    // The full 165s waiter bound (`LOCK_WAIT_TIMEOUT`) is not exercisable in a
+    // unit test, so these drive `acquire_auth_lock` with explicit deadlines to
+    // pin the three properties the coordinator relies on: a contended waiter
+    // times out (never blocks forever), a timeout leaves the *holder*
+    // untouched (never cancels the in-flight attempt), and releasing the
+    // holder — the RAII stand-in for a crashed process — lets a successor
+    // proceed with no wedge and no lock-breaking.
+
+    #[tokio::test]
+    async fn test_lock_wait_times_out_and_leaves_holder_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json.lock");
+
+        // Holder takes the lock with a generous deadline.
+        let holder = acquire_auth_lock(&path, Instant::now() + Duration::from_secs(30))
+            .await
+            .expect("holder should acquire the free lock");
+
+        // A waiter with an already-lapsed deadline must give up with
+        // LockTimeout rather than block — this is the deadline-aware polling
+        // that replaces a blocking `lock()`.
+        let waiter = acquire_auth_lock(&path, Instant::now()).await;
+        assert!(
+            matches!(waiter, Err(AuthError::LockTimeout)),
+            "contended waiter past its deadline must return LockTimeout, got {waiter:?}"
+        );
+
+        // The timeout did not cancel or steal the holder: a second immediate
+        // waiter still cannot acquire, proving the holder is intact.
+        let still_held = acquire_auth_lock(&path, Instant::now()).await;
+        assert!(
+            matches!(still_held, Err(AuthError::LockTimeout)),
+            "holder must remain intact after a waiter times out, got {still_held:?}"
+        );
+
+        drop(holder);
+    }
+
+    #[tokio::test]
+    async fn test_lock_released_on_holder_drop_lets_successor_proceed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json.lock");
+
+        let holder = acquire_auth_lock(&path, Instant::now() + Duration::from_secs(30))
+            .await
+            .expect("holder should acquire the free lock");
+        // Confirm contention while held.
+        assert!(matches!(
+            acquire_auth_lock(&path, Instant::now()).await,
+            Err(AuthError::LockTimeout)
+        ));
+
+        // Dropping the guard is the RAII stand-in for the holder process
+        // dying: the kernel releases the advisory lock, so a successor
+        // acquires without any PID inspection or lock breaking.
+        drop(holder);
+        let successor = acquire_auth_lock(&path, Instant::now() + Duration::from_secs(30)).await;
+        assert!(
+            successor.is_ok(),
+            "successor must acquire after the holder releases, got {successor:?}"
         );
     }
 }

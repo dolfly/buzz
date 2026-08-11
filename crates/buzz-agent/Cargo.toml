@@ -2,7 +2,9 @@
 name = "buzz-agent"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# Above the 1.88 workspace floor: the auth coordinator's cross-process
+# single-flight uses `std::fs::File::try_lock`/`unlock`, stable since 1.89.
+rust-version = "1.89.0"
 license.workspace = true
 repository.workspace = true
 description = "Minimal, unbreakable ACP-compliant agent. Non-streaming. Tool-calls-as-output."
