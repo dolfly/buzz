@@ -289,6 +289,66 @@ void main() {
       );
 
       test(
+        'skipped preflight authorization reauthenticates before sending nsec',
+        () async {
+          await notifier.pair(recoveryCode);
+          notifier.confirmSas();
+          socket.sendSourceMessage(
+            sourceSecret: sourceSecret,
+            sessionSecretHex: sessionSecretHex,
+            message: {'type': 'sas-confirm'},
+            includeTranscriptHash: true,
+          );
+          await Future<void>.delayed(Duration.zero);
+
+          expect(authorizer.calls, 1);
+          expect(
+            container.read(pairingProvider).status,
+            PairingStatus.transferring,
+          );
+          final sentMessages = socket.decryptedPublishedMessages(sourceSecret);
+          expect(
+            sentMessages.any(
+              (message) =>
+                  message['type'] == 'payload' &&
+                  message['payload_type'] == 'nsec' &&
+                  message['payload'] == _RecoveryRelayConfig.nsec,
+            ),
+            isTrue,
+          );
+        },
+      );
+
+      test(
+        'failed transfer reauthorization publishes no identity payload',
+        () async {
+          expect(await notifier.authorizeIdentityExport(), isTrue);
+          await notifier.pair(recoveryCode);
+          now = now.add(identityExportAuthorizationTtl);
+          authorizer.result = DeviceAuthResult.cancelled;
+          notifier.confirmSas();
+          socket.sendSourceMessage(
+            sourceSecret: sourceSecret,
+            sessionSecretHex: sessionSecretHex,
+            message: {'type': 'sas-confirm'},
+            includeTranscriptHash: true,
+          );
+          await Future<void>.delayed(Duration.zero);
+
+          expect(authorizer.calls, 2);
+          final state = container.read(pairingProvider);
+          expect(state.status, PairingStatus.confirmingSas);
+          expect(state.userConfirmedSas, isFalse);
+          expect(state.errorMessage, contains('cancelled'));
+          final sentMessages = socket.decryptedPublishedMessages(sourceSecret);
+          expect(
+            sentMessages.any((message) => message['type'] == 'payload'),
+            isFalse,
+          );
+        },
+      );
+
+      test(
         'expired recovery authorization reauthenticates before transfer',
         () async {
           expect(await notifier.authorizeIdentityExport(), isTrue);
