@@ -38,6 +38,7 @@ class PairingState {
   final String? sasCode;
   final bool userConfirmedSas;
   final bool sendsIdentityToDesktop;
+  final bool protectSensitiveActions;
   final bool authorizationInProgress;
 
   const PairingState({
@@ -46,6 +47,7 @@ class PairingState {
     this.sasCode,
     this.userConfirmedSas = false,
     this.sendsIdentityToDesktop = false,
+    this.protectSensitiveActions = true,
     this.authorizationInProgress = false,
   });
 
@@ -55,6 +57,7 @@ class PairingState {
     String? sasCode,
     bool? userConfirmedSas,
     bool? sendsIdentityToDesktop,
+    bool? protectSensitiveActions,
     bool? authorizationInProgress,
     bool clearErrorMessage = false,
   }) => PairingState(
@@ -64,6 +67,8 @@ class PairingState {
     userConfirmedSas: userConfirmedSas ?? this.userConfirmedSas,
     sendsIdentityToDesktop:
         sendsIdentityToDesktop ?? this.sendsIdentityToDesktop,
+    protectSensitiveActions:
+        protectSensitiveActions ?? this.protectSensitiveActions,
     authorizationInProgress:
         authorizationInProgress ?? this.authorizationInProgress,
   );
@@ -77,6 +82,9 @@ typedef PairingSocketFactory =
       required void Function(Object? error) onDisconnected,
     });
 
+typedef PairingCredentialValidator =
+    Future<void> Function({required String relayUrl, required String? nsec});
+
 const identityExportAuthorizationTtl = Duration(minutes: 2);
 
 final identityExportClockProvider = Provider<DateTime Function()>((ref) {
@@ -85,11 +93,15 @@ final identityExportClockProvider = Provider<DateTime Function()>((ref) {
 
 class PairingNotifier extends Notifier<PairingState> {
   final PairingSocketFactory _socketFactory;
+  final PairingCredentialValidator? _credentialValidator;
   PairingSocket? _socket;
   Timer? _sessionTimeout;
 
-  PairingNotifier({PairingSocketFactory? socketFactory})
-    : _socketFactory = socketFactory ?? _createPairingSocket;
+  PairingNotifier({
+    PairingSocketFactory? socketFactory,
+    PairingCredentialValidator? credentialValidator,
+  }) : _socketFactory = socketFactory ?? _createPairingSocket,
+       _credentialValidator = credentialValidator;
 
   static PairingSocket _createPairingSocket({
     required String wsUrl,
@@ -155,6 +167,15 @@ class PairingNotifier extends Notifier<PairingState> {
     _userConfirmedSas = true;
     state = state.copyWith(userConfirmedSas: true);
     if (_sasConfirmReceived) unawaited(_continueAfterSas());
+  }
+
+  void setProtectSensitiveActions(bool value) {
+    if (state.status != PairingStatus.confirmingSas ||
+        state.sendsIdentityToDesktop ||
+        state.authorizationInProgress) {
+      return;
+    }
+    state = state.copyWith(protectSensitiveActions: value);
   }
 
   Future<void> _continueAfterSas() async {
@@ -345,6 +366,7 @@ class PairingNotifier extends Notifier<PairingState> {
         status: PairingStatus.confirmingSas,
         sasCode: formatSas(sasCode),
         sendsIdentityToDesktop: _sendIdentityToSource,
+        protectSensitiveActions: ref.read(relayConfigProvider).nsec == null,
       );
 
       // 9. Start 120s session timeout.
@@ -566,7 +588,16 @@ class PairingNotifier extends Notifier<PairingState> {
       return;
     }
 
-    _processPayload(payloadType, payload);
+    final pairingGeneration = _pairingGeneration;
+    final protectSensitiveActions = state.protectSensitiveActions;
+    unawaited(
+      _processPayload(
+        payloadType,
+        payload,
+        pairingGeneration: pairingGeneration,
+        protectSensitiveActions: protectSensitiveActions,
+      ),
+    );
   }
 
   void _handleComplete(Map<String, dynamic> msg) {
@@ -594,7 +625,12 @@ class PairingNotifier extends Notifier<PairingState> {
     );
   }
 
-  Future<void> _processPayload(String? payloadType, String payload) async {
+  Future<void> _processPayload(
+    String? payloadType,
+    String payload, {
+    required int pairingGeneration,
+    required bool protectSensitiveActions,
+  }) async {
     try {
       // Parse the custom payload.
       final data = jsonDecode(payload) as Map<String, dynamic>;
@@ -610,7 +646,13 @@ class PairingNotifier extends Notifier<PairingState> {
       _validateRelayUrl(relayUrl);
 
       // Validate credentials against the relay via NIP-42 WS handshake.
-      await _validateCredentials(relayUrl: relayUrl, nsec: nsec);
+      final credentialValidator = _credentialValidator ?? _validateCredentials;
+      await credentialValidator(relayUrl: relayUrl, nsec: nsec);
+      if (pairingGeneration != _pairingGeneration ||
+          state.status != PairingStatus.storing ||
+          _sendIdentityToSource) {
+        return;
+      }
 
       // Send complete only after credentials are validated.
       _sendComplete(true);
@@ -621,14 +663,27 @@ class PairingNotifier extends Notifier<PairingState> {
         relayUrl: relayUrl,
         pubkey: pubkey,
         nsec: nsec,
+        sensitiveActionPolicy: protectSensitiveActions
+            ? SensitiveActionPolicy.enabled
+            : SensitiveActionPolicy.disabledByUser,
       );
       await ref
           .read(authProvider.notifier)
           .authenticateWithCommunity(community);
+      if (pairingGeneration != _pairingGeneration ||
+          state.status != PairingStatus.storing ||
+          _sendIdentityToSource) {
+        return;
+      }
 
       _cleanup();
       state = const PairingState(status: PairingStatus.success);
     } catch (e) {
+      if (pairingGeneration != _pairingGeneration ||
+          state.status != PairingStatus.storing ||
+          _sendIdentityToSource) {
+        return;
+      }
       _sendComplete(false);
       _cleanup();
       state = PairingState(

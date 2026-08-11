@@ -188,6 +188,140 @@ void main() {
       expect(container.read(pairingProvider).status, PairingStatus.idle);
     });
 
+    group('identity import protection', () {
+      const sourceSecret =
+          '09b3065e3570a3a4054660dccd66e12774a99a904fdb0ca02dbc6c3136249506';
+      const sessionSecretHex =
+          'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789';
+      late _ControllableSocket socket;
+      late PairingNotifier notifier;
+      late FakeAuthNotifier importAuth;
+      late Completer<void> validation;
+      late String pairingCode;
+
+      setUp(() {
+        final source = nostr.Keys(sourceSecret);
+        pairingCode =
+            'nostrpair://${source.public}'
+            '?secret=$sessionSecretHex'
+            '&relay=wss%3A%2F%2Fpairing.buzz.xyz&v=1';
+        validation = Completer<void>();
+        importAuth = FakeAuthNotifier();
+        notifier = PairingNotifier(
+          credentialValidator:
+              ({required String relayUrl, required String? nsec}) =>
+                  validation.future,
+          socketFactory:
+              ({
+                required wsUrl,
+                required ephemeralPrivkey,
+                required onMessage,
+                required onDisconnected,
+              }) {
+                socket = _ControllableSocket(
+                  ephemeralPrivkey: ephemeralPrivkey,
+                  onMessage: onMessage,
+                  onDisconnected: onDisconnected,
+                );
+                return socket;
+              },
+        );
+        container = ProviderContainer(
+          overrides: [
+            pairingProvider.overrideWith(() => notifier),
+            authProvider.overrideWith(() => importAuth),
+          ],
+        );
+        container.read(pairingProvider);
+        notifier = container.read(pairingProvider.notifier);
+      });
+
+      Future<void> beginImport({required bool protected}) async {
+        await notifier.pair(pairingCode);
+        notifier.setProtectSensitiveActions(protected);
+        notifier.confirmSas();
+        socket.sendSourceMessage(
+          sourceSecret: sourceSecret,
+          sessionSecretHex: sessionSecretHex,
+          message: {'type': 'sas-confirm'},
+          includeTranscriptHash: true,
+        );
+        socket.sendSourceMessage(
+          sourceSecret: sourceSecret,
+          sessionSecretHex: sessionSecretHex,
+          message: {
+            'type': 'payload',
+            'payload_type': 'credentials',
+            'payload': jsonEncode({
+              'relayUrl': 'https://relay.test',
+              'pubkey': nostr.Keys(sourceSecret).public,
+              'nsec': nostr.Keys(sourceSecret).nsec,
+            }),
+          },
+        );
+        await Future<void>.delayed(Duration.zero);
+        expect(container.read(pairingProvider).status, PairingStatus.storing);
+      }
+
+      test('unchecked protection persists on a successful import', () async {
+        await beginImport(protected: false);
+
+        validation.complete();
+        await Future<void>.delayed(Duration.zero);
+
+        expect(
+          importAuth.lastCommunity?.sensitiveActionPolicy,
+          SensitiveActionPolicy.disabledByUser,
+        );
+        expect(container.read(pairingProvider).status, PairingStatus.success);
+      });
+
+      test('checked protection persists on a successful import', () async {
+        await beginImport(protected: true);
+
+        validation.complete();
+        await Future<void>.delayed(Duration.zero);
+
+        expect(
+          importAuth.lastCommunity?.sensitiveActionPolicy,
+          SensitiveActionPolicy.enabled,
+        );
+      });
+
+      test('reset invalidates pending authentication persistence', () async {
+        importAuth.authentication = Completer<void>();
+        await beginImport(protected: false);
+
+        validation.complete();
+        await Future<void>.delayed(Duration.zero);
+        expect(importAuth.lastCommunity, isNotNull);
+
+        notifier.reset();
+        importAuth.authentication!.complete();
+        await Future<void>.delayed(Duration.zero);
+
+        expect(container.read(pairingProvider).status, PairingStatus.idle);
+        expect(socket.isConnected, isFalse);
+      });
+
+      test('reset invalidates pending credential validation', () async {
+        await beginImport(protected: false);
+
+        notifier.reset();
+        validation.complete();
+        await Future<void>.delayed(Duration.zero);
+
+        expect(importAuth.lastCommunity, isNull);
+        expect(container.read(pairingProvider).status, PairingStatus.idle);
+        expect(
+          socket
+              .decryptedPublishedMessages(sourceSecret)
+              .any((message) => message['type'] == 'complete'),
+          isFalse,
+        );
+      });
+    });
+
     group('desktop identity recovery', () {
       const sourceSecret =
           '09b3065e3570a3a4054660dccd66e12774a99a904fdb0ca02dbc6c3136249506';
@@ -496,6 +630,7 @@ String _encodePairingCode({
 class FakeAuthNotifier extends AsyncNotifier<AuthState>
     implements AuthNotifier {
   Community? lastCommunity;
+  Completer<void>? authentication;
   bool signedOut = false;
 
   @override
@@ -511,6 +646,7 @@ class FakeAuthNotifier extends AsyncNotifier<AuthState>
   @override
   Future<void> authenticateWithCommunity(Community community) async {
     lastCommunity = community;
+    await authentication?.future;
     state = AsyncData(
       AuthState(status: AuthStatus.authenticated, community: community),
     );
