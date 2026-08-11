@@ -240,10 +240,7 @@ void main() {
         find.byKey(const Key('protect-sensitive-actions-checkbox')),
       );
       expect(checkbox.value, isTrue);
-      expect(
-        find.text('Use device authentication when extra protection is needed.'),
-        findsOneWidget,
-      );
+      expect(find.text('For secure actions'), findsOneWidget);
     });
 
     testWidgets('desktop recovery does not show protection checkbox', (
