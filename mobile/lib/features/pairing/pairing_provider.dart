@@ -124,6 +124,7 @@ class PairingNotifier extends Notifier<PairingState> {
   Future<bool> authorizeIdentityExport() async {
     if (state.authorizationInProgress) return false;
 
+    final pairingGeneration = _pairingGeneration;
     state = state.copyWith(
       authorizationInProgress: true,
       clearErrorMessage: true,
@@ -131,6 +132,7 @@ class PairingNotifier extends Notifier<PairingState> {
     final result = await ref
         .read(sensitiveActionAuthorizationSessionProvider)
         .authorize();
+    if (pairingGeneration != _pairingGeneration) return false;
     if (result != DeviceAuthResult.success) {
       state = state.copyWith(
         authorizationInProgress: false,
@@ -164,16 +166,26 @@ class PairingNotifier extends Notifier<PairingState> {
     }
 
     final authorizedAt = _identityExportAuthorizedAt;
+    final elapsed = authorizedAt == null
+        ? null
+        : ref.read(identityExportClockProvider)().difference(authorizedAt);
     final hasFreshExportAuthorization =
-        authorizedAt != null &&
-        ref.read(identityExportClockProvider)().difference(authorizedAt) <
-            identityExportAuthorizationTtl;
+        elapsed != null &&
+        !elapsed.isNegative &&
+        elapsed < identityExportAuthorizationTtl;
     if (_sendIdentityToSource && !hasFreshExportAuthorization) {
+      final pairingGeneration = _pairingGeneration;
       state = state.copyWith(authorizationInProgress: true);
       final result = await ref
           .read(sensitiveActionAuthorizationSessionProvider)
           .authorize();
-      if (state.status != PairingStatus.confirmingSas) return;
+      if (pairingGeneration != _pairingGeneration ||
+          !_userConfirmedSas ||
+          !_sasConfirmReceived ||
+          state.status != PairingStatus.confirmingSas ||
+          !state.authorizationInProgress) {
+        return;
+      }
       if (result != DeviceAuthResult.success) {
         _userConfirmedSas = false;
         state = state.copyWith(
@@ -231,6 +243,7 @@ class PairingNotifier extends Notifier<PairingState> {
   }
 
   void _cleanup() {
+    _pairingGeneration++;
     _sessionTimeout?.cancel();
     _sessionTimeout = null;
     _socket?.dispose();
@@ -256,6 +269,7 @@ class PairingNotifier extends Notifier<PairingState> {
   bool _sasConfirmReceived = false;
   bool _userConfirmedSas = false;
   bool _sendIdentityToSource = false;
+  int _pairingGeneration = 0;
   DateTime? _identityExportAuthorizedAt;
   Map<String, dynamic>? _pendingPayload; // buffered until user confirms SAS
   final Set<String> _processedEventIds = {}; // NIP-AB §Duplicate Event Handling

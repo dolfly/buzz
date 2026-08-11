@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -349,6 +350,72 @@ void main() {
       );
 
       test(
+        'stale authorization cannot advance a replacement pairing session',
+        () async {
+          expect(await notifier.authorizeIdentityExport(), isTrue);
+          await notifier.pair(recoveryCode);
+          now = now.add(identityExportAuthorizationTtl);
+          final firstSocket = socket;
+          final pendingAuthorization = Completer<DeviceAuthResult>();
+          authorizer.pending = pendingAuthorization;
+          notifier.confirmSas();
+          firstSocket.sendSourceMessage(
+            sourceSecret: sourceSecret,
+            sessionSecretHex: sessionSecretHex,
+            message: {'type': 'sas-confirm'},
+            includeTranscriptHash: true,
+          );
+          await Future<void>.delayed(Duration.zero);
+          expect(authorizer.calls, 2);
+
+          notifier.reset();
+          await notifier.pair(recoveryCode);
+          final replacementSocket = socket;
+          expect(
+            container.read(pairingProvider).status,
+            PairingStatus.confirmingSas,
+          );
+          expect(container.read(pairingProvider).userConfirmedSas, isFalse);
+
+          pendingAuthorization.complete(DeviceAuthResult.success);
+          await Future<void>.delayed(Duration.zero);
+
+          final state = container.read(pairingProvider);
+          expect(state.status, PairingStatus.confirmingSas);
+          expect(state.userConfirmedSas, isFalse);
+          for (final pairingSocket in [firstSocket, replacementSocket]) {
+            final sentMessages = pairingSocket.decryptedPublishedMessages(
+              sourceSecret,
+            );
+            expect(
+              sentMessages.any((message) => message['type'] == 'payload'),
+              isFalse,
+            );
+          }
+        },
+      );
+
+      test('clock rollback invalidates the export authorization', () async {
+        expect(await notifier.authorizeIdentityExport(), isTrue);
+        await notifier.pair(recoveryCode);
+        now = now.subtract(const Duration(minutes: 1));
+        notifier.confirmSas();
+        socket.sendSourceMessage(
+          sourceSecret: sourceSecret,
+          sessionSecretHex: sessionSecretHex,
+          message: {'type': 'sas-confirm'},
+          includeTranscriptHash: true,
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        expect(authorizer.calls, 2);
+        expect(
+          container.read(pairingProvider).status,
+          PairingStatus.transferring,
+        );
+      });
+
+      test(
         'expired recovery authorization reauthenticates before transfer',
         () async {
           expect(await notifier.authorizeIdentityExport(), isTrue);
@@ -479,12 +546,13 @@ class _RecoveryRelayConfig extends RelayConfigNotifier {
 
 class _FakeSensitiveActionAuthorizer implements SensitiveActionAuthorizer {
   DeviceAuthResult result = DeviceAuthResult.success;
+  Completer<DeviceAuthResult>? pending;
   int calls = 0;
 
   @override
   Future<DeviceAuthResult> authorizeIdentityAction() async {
     calls++;
-    return result;
+    return pending?.future ?? result;
   }
 }
 
