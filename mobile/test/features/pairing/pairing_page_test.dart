@@ -240,6 +240,7 @@ void main() {
         find.byKey(const Key('protect-sensitive-actions-checkbox')),
       );
       expect(checkbox.value, isTrue);
+      expect(find.text('Use device authentication'), findsOneWidget);
       expect(find.text('For secure actions'), findsOneWidget);
     });
 

@@ -289,7 +289,7 @@ class _SasVerificationView extends StatelessWidget {
                 : (value) => onProtectionChanged(value ?? false),
             controlAffinity: ListTileControlAffinity.leading,
             contentPadding: EdgeInsets.zero,
-            title: const Text('Protect sensitive actions'),
+            title: const Text('Use device authentication'),
             subtitle: const Text('For secure actions'),
           ),
 
