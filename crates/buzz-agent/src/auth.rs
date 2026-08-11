@@ -15,19 +15,21 @@
 //! captures the redirect, and exchanges the code for a token. Subsequent
 //! calls hit the cache and silently refresh when expired.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::Engine;
+use fs2::FileExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Digest;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 
 use crate::types::AgentError;
 
@@ -319,6 +321,24 @@ struct OidcEndpoints {
     token_endpoint: String,
 }
 
+/// Typed result of a refresh-token grant, so the coordinator can separate an
+/// actual credential rejection from a transient fault.
+///
+/// - [`Refreshed`](Self::Refreshed): a fresh token — success.
+/// - [`Rejected`](Self::Rejected): the token endpoint rejected the *grant*
+///   (dead/rotated refresh token). This is the only outcome that becomes
+///   [`AuthError::RefreshRejected`] for `Headless` or drives a browser
+///   fallback for interactive intents.
+/// - [`Network`](Self::Network): transport error, timeout, 5xx, or an
+///   undecodable/malformed response — infrastructural, never a credential
+///   decision, so it surfaces as [`AuthError::NetworkUnavailable`] and never
+///   pops a browser.
+enum RefreshOutcome {
+    Refreshed(CachedToken),
+    Rejected,
+    Network,
+}
+
 /// PKCE OAuth token source with on-disk refresh cache.
 ///
 /// First call:
@@ -356,6 +376,24 @@ impl PkceOAuthTokenSource {
         cfg: PkceOAuthConfig,
         opener: Arc<dyn BrowserOpener>,
     ) -> Result<Arc<Self>, AgentError> {
+        Self::new_with_http_timeout(cfg, opener, HTTP_REQUEST_TIMEOUT)
+    }
+
+    /// Construct with an injected opener *and* an explicit per-request HTTP
+    /// timeout. Only the refresh-timeout integration test passes the timeout
+    /// argument: it drives a hung token endpoint against a short bound so the
+    /// per-request timeout classification (`NetworkUnavailable`, never
+    /// `RefreshRejected`) is exercised in real time. A paused-clock test can't
+    /// do this — tokio auto-advances into the timer while the real loopback
+    /// discovery call is still in flight, tripping the timeout on the wrong
+    /// request. Every production and other-test path goes through
+    /// [`new`](Self::new) or [`new_with`](Self::new_with) at the default
+    /// [`HTTP_REQUEST_TIMEOUT`].
+    pub fn new_with_http_timeout(
+        cfg: PkceOAuthConfig,
+        opener: Arc<dyn BrowserOpener>,
+        http_timeout: Duration,
+    ) -> Result<Arc<Self>, AgentError> {
         let cache_path = cache_path_for(&cfg)?;
         if let Some(parent) = cache_path.parent() {
             fs::create_dir_all(parent)
@@ -363,12 +401,14 @@ impl PkceOAuthTokenSource {
         }
         // Every OAuth HTTP call inherits this timeout so a hung provider can
         // never stall the caller — nor the same-key callers waiting on the
-        // cross-process lock this holder owns. A build failure falls back to
-        // the untimed default rather than making construction fallible.
+        // cross-process lock this holder owns. Construction is fallible, so a
+        // build failure propagates rather than silently falling back to an
+        // untimed client — an untimed client would restore exactly the
+        // unbounded-HTTP-under-lock failure the timeout exists to prevent.
         let http = Client::builder()
-            .timeout(HTTP_REQUEST_TIMEOUT)
+            .timeout(http_timeout)
             .build()
-            .unwrap_or_else(|_| Client::new());
+            .map_err(|e| AgentError::Llm(format!("oauth http client: {e}")))?;
         let initial = read_cache(&cache_path);
         Ok(Arc::new(Self {
             cfg,
@@ -439,32 +479,62 @@ impl PkceOAuthTokenSource {
     }
 
     /// Exchange a refresh token for a fresh access token.
-    async fn refresh(
-        &self,
-        endpoints: &OidcEndpoints,
-        refresh_token: &str,
-    ) -> Result<CachedToken, AgentError> {
+    ///
+    /// The outcome is typed so the caller can tell an actual credential
+    /// rejection apart from a transient fault. Only a token-endpoint rejection
+    /// of the grant itself (a 4xx `invalid_grant`-class response) is a dead
+    /// refresh token; a transport failure, timeout, 5xx, or an
+    /// undecodable/malformed response is infrastructural and must never be
+    /// mistaken for a credential decision (it would otherwise pop a browser or
+    /// return `RefreshRejected` when nothing was actually rejected).
+    async fn refresh(&self, endpoints: &OidcEndpoints, refresh_token: &str) -> RefreshOutcome {
         let params = [
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
             ("client_id", &self.cfg.client_id),
         ];
-        let resp = self
+        let resp = match self
             .http
             .post(&endpoints.token_endpoint)
             .form(&params)
             .send()
             .await
-            .map_err(|e| AgentError::Llm(format!("oauth refresh: {e}")))?;
-        if !resp.status().is_success() {
+        {
+            Ok(resp) => resp,
+            // Transport error or the per-request timeout elapsed: no verdict
+            // from the provider, so this is infrastructural, not a rejection.
+            Err(e) => {
+                tracing::warn!(error = %e, "oauth refresh transport failure");
+                return RefreshOutcome::Network;
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(AgentError::Llm(format!("oauth refresh failed: {body}")));
+            // A 4xx is the token endpoint rejecting the grant (dead/rotated
+            // refresh token). A 5xx is a provider-side fault — transient, not a
+            // credential decision — so it stays in the infrastructural bucket.
+            if status.is_client_error() {
+                tracing::warn!(status = %status, body = %body, "oauth refresh grant rejected");
+                return RefreshOutcome::Rejected;
+            }
+            tracing::warn!(status = %status, body = %body, "oauth refresh server error");
+            return RefreshOutcome::Network;
         }
-        let v: Value = resp
-            .json()
-            .await
-            .map_err(|e| AgentError::Llm(format!("oauth refresh json: {e}")))?;
-        token_from_response(&v, Some(refresh_token))
+        let v: Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "oauth refresh response decode failure");
+                return RefreshOutcome::Network;
+            }
+        };
+        match token_from_response(&v, Some(refresh_token)) {
+            Ok(token) => RefreshOutcome::Refreshed(token),
+            Err(e) => {
+                tracing::warn!(error = %e, "oauth refresh response missing access_token");
+                RefreshOutcome::Network
+            }
+        }
     }
 
     /// Run the full browser-mediated Authorization Code + PKCE flow and cache
@@ -473,19 +543,40 @@ impl PkceOAuthTokenSource {
     /// and single-flights with concurrent callers on the cross-process lock. A
     /// still-valid cached token short-circuits to success without re-prompting.
     ///
+    /// This is the no-rejected convenience: it trusts the local expiry clock,
+    /// so a not-yet-expired cached token is accepted. When the caller already
+    /// knows the cached bearer was rejected by the server (a 401), it must use
+    /// [`acquire_with_intent`](Self::acquire_with_intent) with `rejected` set
+    /// so the stale-but-fresh token can't short-circuit the sign-in.
+    ///
     /// [`UserInitiated`]: AuthIntent::UserInitiated
     pub async fn interactive_login(&self) -> Result<(), AgentError> {
         self.acquire(AuthIntent::UserInitiated, None).await?;
         Ok(())
     }
 
-    /// Public entry for passive Desktop discovery (Phase 2): acquire a bearer
-    /// under an explicit [`AuthIntent`], returning the typed [`AuthError`] so
-    /// the caller can branch on a stable `code` rather than display text. The
-    /// [`TokenSource`] trait methods wrap this and flatten the error into
-    /// [`AgentError`].
-    pub async fn acquire_with_intent(&self, intent: AuthIntent) -> Result<String, AuthError> {
-        self.acquire(intent, None).await
+    /// Public entry for passive Desktop discovery and the saved-model picker
+    /// (Phase 2): acquire a bearer under an explicit [`AuthIntent`], returning
+    /// the typed [`AuthError`] so the caller can branch on a stable `code`
+    /// rather than display text. The [`TokenSource`] trait methods wrap this
+    /// and flatten the error into [`AgentError`].
+    ///
+    /// `rejected` carries the exact access token the provider just 401'd, if
+    /// any. With `rejected = None` a locally-fresh cached token is a hit (the
+    /// normal discovery path). With `rejected = Some(t)` the expiry clock is
+    /// untrustworthy — the rejected token looked fresh — so a cached token
+    /// equal to `t` is *not* a hit: the acquisition refreshes, and for `Auto`
+    /// or `UserInitiated` falls through to a browser when the refresh grant is
+    /// dead. This is what lets the saved-picker recovery path say "this
+    /// locally-fresh bearer was just rejected — replace it" instead of
+    /// re-returning the dead token, which `refresh_now`'s hardcoded
+    /// [`Headless`](AuthIntent::Headless) can never escalate to a browser.
+    pub async fn acquire_with_intent(
+        &self,
+        intent: AuthIntent,
+        rejected: Option<&str>,
+    ) -> Result<String, AuthError> {
+        self.acquire(intent, rejected).await
     }
 
     /// Return a usable cached bearer, applying the identity rule for a
@@ -555,14 +646,64 @@ impl PkceOAuthTokenSource {
         intent: AuthIntent,
         rejected: Option<&str>,
     ) -> Result<String, AuthError> {
-        // Fast path: no lock, no network.
+        // Fast path: no lock, no network. `try_lock` rather than `lock().await`
+        // so a caller arriving while a leader holds `state` across its browser
+        // flow does not block here — it falls through to the in-process
+        // registry below and joins the leader instead of waiting out the whole
+        // flow and then racing in as a second leader. A cache hit is still
+        // served without the file lock; a miss (or contention) coalesces.
         {
-            let mut state = self.state.lock().await;
-            if let Some(hit) = self.cached_hit(&mut state, rejected) {
-                return Ok(hit);
+            if let Ok(mut state) = self.state.try_lock() {
+                if let Some(hit) = self.cached_hit(&mut state, rejected) {
+                    return Ok(hit);
+                }
             }
         }
 
+        // In-process single-flight (see [`INFLIGHT`]). Keyed by (lock path,
+        // browser capability): browser-capable callers coalesce with each
+        // other, so a caller that was already waiting when the leader's attempt
+        // was in flight shares the leader's result instead of taking the lock
+        // after it and launching a second browser. A `Headless` caller never
+        // shares a browser-capable slot (and vice versa), so a racing inference
+        // call is neither handed an interactive failure nor able to deny an
+        // explicit sign-in its browser — those two intents still coordinate
+        // only through the cross-process file lock.
+        let key: InflightKey = (self.lock_path(), intent.may_open_browser());
+        let (slot, is_leader) = {
+            let mut reg = inflight_registry();
+            match reg.get(&key) {
+                Some(existing) => (existing.clone(), false),
+                None => {
+                    let slot = Arc::new(InflightSlot::new());
+                    reg.insert(key.clone(), slot.clone());
+                    (slot, true)
+                }
+            }
+        };
+        if !is_leader {
+            // Pre-existing joiner: observe the leader's outcome.
+            return slot.wait().await;
+        }
+
+        // Leader: run the real flow, then evict + publish. The guard makes
+        // eviction and joiner wake-up happen even if this future is cancelled
+        // or panics, so a dropped leader can never wedge its joiners or leave a
+        // dead slot that turns later callers into joiners of nothing.
+        let guard = LeaderGuard::new(key, slot);
+        let result = self.acquire_leader(intent, rejected).await;
+        guard.complete(result)
+    }
+
+    /// The leader's slow-path body: take the cross-process lock, then run the
+    /// bounded acquisition under it. Split out so [`acquire`] can wrap it in
+    /// the in-process single-flight without the lock/deadline logic bleeding
+    /// into the joiner path.
+    async fn acquire_leader(
+        &self,
+        intent: AuthIntent,
+        rejected: Option<&str>,
+    ) -> Result<String, AuthError> {
         // Slow path: one flow at a time per cache key. The waiter's deadline
         // exceeds a healthy holder's attempt deadline, so it never gives up on
         // a live holder.
@@ -570,21 +711,31 @@ impl PkceOAuthTokenSource {
         let _guard = acquire_auth_lock(&self.lock_path(), deadline).await?;
 
         // Bound the whole locked attempt so a wedged flow can't hold the lock
-        // past the waiters' patience. On expiry the lock releases (guard drop)
-        // and the attempt reports TimedOut.
-        match tokio::time::timeout(AUTH_ATTEMPT_DEADLINE, self.acquire_locked(intent, rejected))
+        // past the waiters' patience. The deadline is passed *into*
+        // `acquire_locked` rather than wrapped around it in a cancelling
+        // `tokio::time::timeout`: a cancel drops the future at an arbitrary
+        // await point, which would skip the cooldown write for a timed-out
+        // interactive attempt and let the next `Auto` caller re-pop a browser.
+        // Threading the deadline lets every interactive timeout exit through
+        // the common outcome writer while the lock is still held.
+        let attempt_deadline = std::time::Instant::now() + AUTH_ATTEMPT_DEADLINE;
+        self.acquire_locked(intent, rejected, attempt_deadline)
             .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(AuthError::TimedOut),
-        }
     }
 
     /// Slow-path body, run while holding the cross-process auth lock.
+    ///
+    /// `attempt_deadline` bounds the whole locked flow. Discovery and refresh
+    /// are each bounded by the HTTP client's per-request timeout; the browser
+    /// flow is wrapped in the *remaining* budget so a total-deadline expiry
+    /// during the interactive step surfaces as [`AuthError::TimedOut`] through
+    /// the same arm that records the cooldown — never as a cancellation that
+    /// drops the guard without writing it.
     async fn acquire_locked(
         &self,
         intent: AuthIntent,
         rejected: Option<&str>,
+        attempt_deadline: std::time::Instant,
     ) -> Result<String, AuthError> {
         let mut state = self.state.lock().await;
 
@@ -602,10 +753,23 @@ impl PkceOAuthTokenSource {
         if let Some(rt) = state.as_ref().and_then(|t| t.refresh_token.clone()) {
             let eps = self.discover(&mut endpoints).await?;
             match self.refresh(eps, &rt).await {
-                Ok(fresh) => return self.finish(&mut state, fresh),
-                Err(e) => {
-                    tracing::warn!(error = %e, "oauth refresh failed; falling back");
-                    // A sibling may still have won the race while we ran.
+                RefreshOutcome::Refreshed(fresh) => return self.finish(&mut state, fresh),
+                // A transient fault (transport/timeout/5xx/decode) is not a
+                // credential decision: never fall through to a browser or
+                // report RefreshRejected. A sibling may have written a fresh
+                // token while we ran, so honor that first; otherwise this is
+                // infrastructural and surfaces as NetworkUnavailable.
+                RefreshOutcome::Network => {
+                    if let Some(hit) = self.cached_hit(&mut state, rejected) {
+                        return Ok(hit);
+                    }
+                    return Err(AuthError::NetworkUnavailable);
+                }
+                // The token endpoint rejected the grant: a dead refresh token.
+                // A sibling may still have won the race while we ran; if not,
+                // fall through to a browser (interactive) or RefreshRejected
+                // (headless).
+                RefreshOutcome::Rejected => {
                     if let Some(hit) = self.cached_hit(&mut state, rejected) {
                         return Ok(hit);
                     }
@@ -636,7 +800,19 @@ impl PkceOAuthTokenSource {
         }
 
         let eps = self.discover(&mut endpoints).await?;
-        match browser_pkce_flow(&self.http, &self.cfg, eps, self.opener.as_ref()).await {
+        // Wrap the browser flow in the *remaining* attempt budget so the total
+        // locked time never exceeds `attempt_deadline` (and thus never
+        // outlasts a waiter's `LOCK_WAIT_TIMEOUT`). A deadline expiry maps to
+        // `TimedOut`, which is cooldown-worthy, so it flows through the same
+        // writer arm below instead of being dropped by a cancel that would
+        // release the lock without recording the cooldown.
+        let remaining = attempt_deadline.saturating_duration_since(std::time::Instant::now());
+        let flow = browser_pkce_flow(&self.http, &self.cfg, eps, self.opener.as_ref());
+        let outcome = match tokio::time::timeout(remaining, flow).await {
+            Ok(result) => result,
+            Err(_) => Err(AuthError::TimedOut),
+        };
+        match outcome {
             // `finish` clears the cooldown on success.
             Ok(fresh) => self.finish(&mut state, fresh),
             Err(e) => {
@@ -824,20 +1000,24 @@ struct AuthLockGuard(fs::File);
 impl Drop for AuthLockGuard {
     fn drop(&mut self) {
         // Explicit for intent; closing the fd would release it regardless.
-        let _ = self.0.unlock();
+        let _ = FileExt::unlock(&self.0);
     }
 }
 
 /// Acquire the cross-process auth lock at `path`, polling until `deadline`.
 ///
-/// `File::try_lock` is per–open-file-description, so a lock taken on one
-/// handle blocks every other handle — same process or not — which is exactly
-/// the single-flight guarantee we want without a separate in-memory registry.
-/// The lock is non-blocking, so we poll on [`LOCK_POLL_INTERVAL`] rather than
-/// parking a worker thread in a blocking `lock()`. A waiter whose `deadline`
-/// lapses returns [`AuthError::LockTimeout`]; because the caller sets that
-/// deadline longer than [`AUTH_ATTEMPT_DEADLINE`], a healthy holder always
-/// finishes first.
+/// `fs2::FileExt::try_lock_exclusive` maps to `flock(LOCK_EX | LOCK_NB)` on
+/// Unix and `LockFileEx` on Windows — advisory, per–open-file-description, so
+/// a lock taken on one handle blocks every other handle (same process or not),
+/// which is exactly the cross-process single-flight guarantee we want. The
+/// try-lock is non-blocking, so we poll on [`LOCK_POLL_INTERVAL`] rather than
+/// parking a worker thread in a blocking `lock_exclusive()`. Contention is
+/// reported as [`fs2::lock_contended_error`] (`EWOULDBLOCK`/`EACCES` on Unix,
+/// `ERROR_LOCK_VIOLATION` on Windows); we match its `raw_os_error` and retry.
+/// Any other error is a real fault and returns [`AuthError::LockTimeout`]. A
+/// waiter whose `deadline` lapses also returns [`AuthError::LockTimeout`];
+/// because the caller sets that deadline longer than [`AUTH_ATTEMPT_DEADLINE`],
+/// a healthy holder always finishes first.
 async fn acquire_auth_lock(
     path: &Path,
     deadline: std::time::Instant,
@@ -851,17 +1031,148 @@ async fn acquire_auth_lock(
         .write(true)
         .open(path)
         .map_err(|_| AuthError::LockTimeout)?;
+    let contended = fs2::lock_contended_error().raw_os_error();
     loop {
-        match file.try_lock() {
+        match file.try_lock_exclusive() {
             Ok(()) => return Ok(AuthLockGuard(file)),
-            Err(fs::TryLockError::WouldBlock) => {
+            Err(e) if e.raw_os_error() == contended => {
                 if std::time::Instant::now() >= deadline {
                     return Err(AuthError::LockTimeout);
                 }
                 tokio::time::sleep(LOCK_POLL_INTERVAL).await;
             }
-            Err(fs::TryLockError::Error(_)) => return Err(AuthError::LockTimeout),
+            Err(_) => return Err(AuthError::LockTimeout),
         }
+    }
+}
+
+/// Key for the in-process single-flight registry: the cross-process lock path
+/// (one per cache key) paired with whether the caller may open a browser.
+/// Browser-capable callers (`Auto`/`UserInitiated`) coalesce with each other;
+/// a `Headless` caller keys separately so it neither inherits an interactive
+/// failure nor denies an explicit sign-in its browser — those two still
+/// coordinate through the cross-process file lock, not this registry.
+type InflightKey = (PathBuf, bool);
+
+/// Process-global registry of in-flight auth attempts, the in-process
+/// counterpart to [`acquire_auth_lock`]'s cross-process file lock. The file
+/// lock serializes work across processes and shares *success* via a cache
+/// re-read, but a queued caller that acquires the lock after a browser denial
+/// would clear the sidecar and pop a second browser. This registry closes that
+/// gap: a caller that arrives while a leader's attempt is in flight joins the
+/// leader's [`InflightSlot`] and receives the *same* result — success or
+/// failure — instead of taking the lock afterward and launching again. Guarded
+/// by a `std::sync::Mutex` because every critical section is a cheap map lookup
+/// with no `.await` held.
+static INFLIGHT: LazyLock<std::sync::Mutex<HashMap<InflightKey, Arc<InflightSlot>>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Lock the in-flight registry, recovering from a poisoned mutex rather than
+/// panicking: the only work done under this lock is map lookups that can't
+/// leave inconsistent state, so a poison from an unrelated panic must not wedge
+/// every future auth attempt.
+fn inflight_registry() -> std::sync::MutexGuard<'static, HashMap<InflightKey, Arc<InflightSlot>>> {
+    INFLIGHT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The shared result of one leader's auth attempt, awaited by any joiner that
+/// arrived while the leader was in flight. A `watch` channel gives us
+/// publish-once plus wait-for-publish in one primitive: the leader publishes
+/// exactly once through [`LeaderGuard`]; joiners clone the published result.
+struct InflightSlot {
+    tx: watch::Sender<Option<Result<String, AuthError>>>,
+    rx: watch::Receiver<Option<Result<String, AuthError>>>,
+}
+
+impl InflightSlot {
+    fn new() -> Self {
+        let (tx, rx) = watch::channel(None);
+        Self { tx, rx }
+    }
+
+    /// Block until the leader publishes, then clone out its result.
+    ///
+    /// `borrow_and_update` marks the current value seen before awaiting, so a
+    /// publish that lands between the read and the `changed()` await is not a
+    /// lost wakeup — the version has advanced, so `changed()` returns at once.
+    /// A closed channel (leader dropped without publishing — which
+    /// [`LeaderGuard`]'s `Drop` prevents) surfaces as a transient so the caller
+    /// retries rather than hangs.
+    async fn wait(&self) -> Result<String, AuthError> {
+        let mut rx = self.rx.clone();
+        loop {
+            if let Some(result) = rx.borrow_and_update().clone() {
+                return result;
+            }
+            if rx.changed().await.is_err() {
+                return Err(AuthError::NetworkUnavailable);
+            }
+        }
+    }
+
+    /// Publish `result` to every waiting joiner. A send error means no joiners
+    /// remain, which is fine.
+    fn publish(&self, result: Result<String, AuthError>) {
+        let _ = self.tx.send(Some(result));
+    }
+}
+
+/// RAII owner of a leader's in-flight slot. Guarantees the slot is evicted from
+/// [`INFLIGHT`] and a result published to joiners even if the leader future is
+/// cancelled or panics: a leader that skipped this would leave a dead slot that
+/// turns every later caller into a joiner of an attempt that never publishes,
+/// wedging them until `LOCK_WAIT_TIMEOUT`.
+struct LeaderGuard {
+    key: InflightKey,
+    slot: Arc<InflightSlot>,
+    done: bool,
+}
+
+impl LeaderGuard {
+    fn new(key: InflightKey, slot: Arc<InflightSlot>) -> Self {
+        Self {
+            key,
+            slot,
+            done: false,
+        }
+    }
+
+    /// Normal completion: evict the slot, publish `result` to joiners, and
+    /// return it to the leader. Evicting *before* publishing means a caller
+    /// arriving after this point starts a fresh attempt (a later explicit
+    /// retry may launch), while joiners already holding the slot still receive
+    /// the result. `Drop` covers the cancel/panic path.
+    fn complete(mut self, result: Result<String, AuthError>) -> Result<String, AuthError> {
+        self.done = true;
+        Self::evict(&self.key, &self.slot);
+        self.slot.publish(result.clone());
+        result
+    }
+
+    /// Remove this leader's slot from the registry, but only if it is still the
+    /// same slot — defends against evicting a successor a later attempt may
+    /// have installed under the same key.
+    fn evict(key: &InflightKey, slot: &Arc<InflightSlot>) {
+        let mut reg = inflight_registry();
+        if reg
+            .get(key)
+            .is_some_and(|existing| Arc::ptr_eq(existing, slot))
+        {
+            reg.remove(key);
+        }
+    }
+}
+
+impl Drop for LeaderGuard {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        // Cancelled or panicked before `complete`: evict so later callers start
+        // fresh, and wake joiners with a transient error so they retry rather
+        // than hang on a leader that will never publish.
+        Self::evict(&self.key, &self.slot);
+        self.slot.publish(Err(AuthError::NetworkUnavailable));
     }
 }
 
@@ -1805,6 +2116,44 @@ mod tests {
         assert!(
             matches!(still_held, Err(AuthError::LockTimeout)),
             "holder must remain intact after a waiter times out, got {still_held:?}"
+        );
+
+        drop(holder);
+    }
+
+    #[tokio::test]
+    async fn test_lock_timeout_leaves_cooldown_sidecar_byte_for_byte_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("cache.json.lock");
+        let cooldown_path = dir.path().join("cache.json.cooldown");
+
+        // A pre-existing cooldown sidecar written by an earlier interactive
+        // failure. A waiter that can't take the lock must return before any
+        // code that reads/clears/writes the cooldown, so these exact bytes
+        // survive untouched — otherwise a lock-contended caller could clear a
+        // live suppression and let the next Auto caller re-pop a browser.
+        let original = br#"{"code":"denied","until":9999999999}"#;
+        fs::write(&cooldown_path, original).unwrap();
+
+        // Holder owns the lock (RAII stand-in for another live process).
+        let holder = acquire_auth_lock(&lock_path, Instant::now() + Duration::from_secs(30))
+            .await
+            .expect("holder should acquire the free lock");
+
+        // A waiter past its deadline gives up with LockTimeout — the `?` in
+        // `acquire_leader` propagates this before `acquire_locked` (which owns
+        // every sidecar mutation) is ever entered.
+        let waiter = acquire_auth_lock(&lock_path, Instant::now()).await;
+        assert!(
+            matches!(waiter, Err(AuthError::LockTimeout)),
+            "contended waiter past its deadline must return LockTimeout, got {waiter:?}"
+        );
+
+        let after = fs::read(&cooldown_path).unwrap();
+        assert_eq!(
+            after.as_slice(),
+            original.as_slice(),
+            "a lock timeout must leave the cooldown sidecar byte-for-byte untouched"
         );
 
         drop(holder);
