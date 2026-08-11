@@ -38,7 +38,6 @@ class PairingState {
   final String? sasCode;
   final bool userConfirmedSas;
   final bool sendsIdentityToDesktop;
-  final bool protectImportedIdentity;
   final bool authorizationInProgress;
 
   const PairingState({
@@ -47,7 +46,6 @@ class PairingState {
     this.sasCode,
     this.userConfirmedSas = false,
     this.sendsIdentityToDesktop = false,
-    this.protectImportedIdentity = true,
     this.authorizationInProgress = false,
   });
 
@@ -57,7 +55,6 @@ class PairingState {
     String? sasCode,
     bool? userConfirmedSas,
     bool? sendsIdentityToDesktop,
-    bool? protectImportedIdentity,
     bool? authorizationInProgress,
     bool clearErrorMessage = false,
   }) => PairingState(
@@ -67,8 +64,6 @@ class PairingState {
     userConfirmedSas: userConfirmedSas ?? this.userConfirmedSas,
     sendsIdentityToDesktop:
         sendsIdentityToDesktop ?? this.sendsIdentityToDesktop,
-    protectImportedIdentity:
-        protectImportedIdentity ?? this.protectImportedIdentity,
     authorizationInProgress:
         authorizationInProgress ?? this.authorizationInProgress,
   );
@@ -83,6 +78,10 @@ typedef PairingSocketFactory =
     });
 
 const identityExportAuthorizationTtl = Duration(minutes: 2);
+
+final identityExportClockProvider = Provider<DateTime Function()>((ref) {
+  return DateTime.now;
+});
 
 class PairingNotifier extends Notifier<PairingState> {
   final PairingSocketFactory _socketFactory;
@@ -140,7 +139,7 @@ class PairingNotifier extends Notifier<PairingState> {
       return false;
     }
 
-    _identityExportAuthorizedAt = ref.read(appLockClockProvider)();
+    _identityExportAuthorizedAt = ref.read(identityExportClockProvider)();
     state = state.copyWith(authorizationInProgress: false);
     return true;
   }
@@ -156,15 +155,6 @@ class PairingNotifier extends Notifier<PairingState> {
     if (_sasConfirmReceived) unawaited(_continueAfterSas());
   }
 
-  void setProtectImportedIdentity(bool value) {
-    if (state.status != PairingStatus.confirmingSas ||
-        state.sendsIdentityToDesktop ||
-        state.authorizationInProgress) {
-      return;
-    }
-    state = state.copyWith(protectImportedIdentity: value);
-  }
-
   Future<void> _continueAfterSas() async {
     if (!_userConfirmedSas ||
         !_sasConfirmReceived ||
@@ -176,13 +166,9 @@ class PairingNotifier extends Notifier<PairingState> {
     final authorizedAt = _identityExportAuthorizedAt;
     final hasFreshExportAuthorization =
         authorizedAt != null &&
-        ref.read(appLockClockProvider)().difference(authorizedAt) <
+        ref.read(identityExportClockProvider)().difference(authorizedAt) <
             identityExportAuthorizationTtl;
-    final requiresAuthorization = _sendIdentityToSource
-        ? !hasFreshExportAuthorization
-        : state.protectImportedIdentity;
-
-    if (requiresAuthorization) {
+    if (_sendIdentityToSource && !hasFreshExportAuthorization) {
       state = state.copyWith(authorizationInProgress: true);
       final result = await ref
           .read(sensitiveActionAuthorizationSessionProvider)
@@ -221,7 +207,7 @@ class PairingNotifier extends Notifier<PairingState> {
     DeviceAuthResult.cancelled =>
       'Identity confirmation was cancelled. Nothing was transferred.',
     DeviceAuthResult.unavailable =>
-      'Device authentication is unavailable. Configure a device passcode or biometrics, or turn off protection for this import.',
+      'Device authentication is unavailable. Configure a device passcode or biometrics and try again.',
     DeviceAuthResult.lockedOut =>
       'Device authentication is locked. Unlock it in system settings and try again.',
     DeviceAuthResult.failed =>
@@ -621,9 +607,6 @@ class PairingNotifier extends Notifier<PairingState> {
         relayUrl: relayUrl,
         pubkey: pubkey,
         nsec: nsec,
-        sensitiveActionPolicy: state.protectImportedIdentity
-            ? SensitiveActionPolicy.enabled
-            : SensitiveActionPolicy.disabledByUser,
       );
       await ref
           .read(authProvider.notifier)
@@ -717,20 +700,6 @@ class PairingNotifier extends Notifier<PairingState> {
 
     try {
       final community = _parseLegacyInput(rawInput);
-      if (community.nsec == null || community.nsec!.isEmpty) {
-        throw const FormatException('Pairing payload missing nsec');
-      }
-      final authorization = await ref
-          .read(sensitiveActionAuthorizationSessionProvider)
-          .authorize();
-      if (authorization != DeviceAuthResult.success) {
-        state = PairingState(
-          status: PairingStatus.error,
-          errorMessage: _authorizationError(authorization),
-        );
-        return;
-      }
-
       await _validateCredentials(
         relayUrl: community.relayUrl,
         nsec: community.nsec,
@@ -813,7 +782,6 @@ class PairingNotifier extends Notifier<PairingState> {
       relayUrl: relayUrl,
       pubkey: decoded['pubkey'] as String?,
       nsec: decoded['nsec'] as String?,
-      sensitiveActionPolicy: SensitiveActionPolicy.enabled,
     );
   }
 

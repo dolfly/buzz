@@ -102,18 +102,13 @@ class _IdentityRow extends StatelessWidget {
 }
 
 void _confirmRemoveCommunity(BuildContext context, WidgetRef ref) {
-  final communityName = ref.read(authProvider).value?.community?.name;
-  final title = communityName == null || communityName.trim().isEmpty
-      ? 'Remove community from this phone?'
-      : 'Remove “$communityName” from this phone?';
-
   showBuzzDialog<void>(
     context: context,
     builder: (ctx) => AlertDialog(
-      title: Text(title),
+      title: const Text('Remove Community'),
       content: const Text(
-        'You’ll be signed out of this community on this phone. '
-        'To come back, you’ll need to add it again from another signed-in device.',
+        'This will disconnect this community. You will need '
+        'to scan a new pairing code to reconnect.',
       ),
       actions: [
         TextButton(

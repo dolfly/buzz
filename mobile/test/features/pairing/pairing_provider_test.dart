@@ -226,14 +226,12 @@ void main() {
           overrides: [
             pairingProvider.overrideWith(() => notifier),
             relayConfigProvider.overrideWith(_RecoveryRelayConfig.new),
-            authProvider.overrideWith(_ProtectedRecoveryAuthNotifier.new),
             sensitiveActionAuthorizerProvider.overrideWithValue(authorizer),
-            appLockClockProvider.overrideWithValue(() => now),
+            identityExportClockProvider.overrideWithValue(() => now),
           ],
         );
         container.read(pairingProvider);
         notifier = container.read(pairingProvider.notifier);
-        await container.read(authProvider.future);
       });
 
       test('recovery authorization happens before pairing starts', () async {
@@ -378,11 +376,6 @@ class FakeAuthNotifier extends AsyncNotifier<AuthState>
       const AuthState(status: AuthStatus.unauthenticated);
 
   @override
-  Future<void> updateSensitiveActionPolicy(
-    SensitiveActionPolicy policy,
-  ) async {}
-
-  @override
   Future<void> signOut() async {
     signedOut = true;
     state = const AsyncData(AuthState(status: AuthStatus.unauthenticated));
@@ -424,21 +417,6 @@ class _RecoveryRelayConfig extends RelayConfigNotifier {
   RelayConfig build() => RelayConfig(baseUrl: 'https://relay.test', nsec: nsec);
 }
 
-class _ProtectedRecoveryAuthNotifier extends AuthNotifier {
-  @override
-  Future<AuthState> build() async => AuthState(
-    status: AuthStatus.authenticated,
-    community: Community(
-      id: 'recovery',
-      name: 'Recovery',
-      relayUrl: 'https://relay.test',
-      nsec: _RecoveryRelayConfig.nsec,
-      sensitiveActionPolicy: SensitiveActionPolicy.enabled,
-      addedAt: DateTime.utc(2026, 8, 5),
-    ),
-  );
-}
-
 class _FakeSensitiveActionAuthorizer implements SensitiveActionAuthorizer {
   DeviceAuthResult result = DeviceAuthResult.success;
   int calls = 0;
@@ -448,9 +426,6 @@ class _FakeSensitiveActionAuthorizer implements SensitiveActionAuthorizer {
     calls++;
     return result;
   }
-
-  @override
-  Future<bool> isSupported() async => true;
 }
 
 class _ControllableSocket extends PairingSocket {

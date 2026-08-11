@@ -79,28 +79,9 @@ internal object AndroidImageProcessor {
 
 class MainActivity : FlutterFragmentActivity() {
     private var mediaUploadChannel: MethodChannel? = null
-    private var appPrivacyChannel: MethodChannel? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-
-        appPrivacyChannel = MethodChannel(
-            flutterEngine.dartExecutor.binaryMessenger,
-            APP_PRIVACY_CHANNEL,
-        ).also { channel ->
-            channel.setMethodCallHandler { call, result ->
-                if (call.method != SET_RECENTS_PROTECTION_METHOD) {
-                    result.notImplemented()
-                    return@setMethodCallHandler
-                }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    // Keep normal screenshots and screen recording available;
-                    // only prevent Android from snapshotting Buzz for Recents.
-                    setRecentsScreenshotEnabled(call.arguments != true)
-                }
-                result.success(null)
-            }
-        }
 
         mediaUploadChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
@@ -355,8 +336,6 @@ class MainActivity : FlutterFragmentActivity() {
     }
 
     companion object {
-        private const val APP_PRIVACY_CHANNEL = "xyz.block.buzz/app_privacy"
-        private const val SET_RECENTS_PROTECTION_METHOD = "setRecentsProtection"
         private const val MEDIA_UPLOAD_CHANNEL = "buzz/media_upload"
         private const val SANITIZE_IMAGE_FOR_UPLOAD_METHOD = "sanitizeImageForUpload"
         private const val TRANSCODE_IMAGE_TO_JPEG_METHOD = "transcodeImageToJpeg"
